@@ -4,11 +4,10 @@ import type { ChatResponse } from '../types/index.js'
 import { v4 as uuidv4 } from 'uuid'
 
 export default async function chatRoutes(fastify: FastifyInstance) {
+  const DEFAULT_USER_ID = 'anonymous'
   // 非流式聊天接口
   fastify.post('/chat', async (request: any, reply: any) => {
     try {
-      const data = await request.file()
-
       let message = ''
       let mode = 'rag'
       let sessionId = ''
@@ -16,16 +15,44 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       let modelName = ''
       let userId = ''
 
-      if (data) {
-        const fields = data.fields
-        message = (fields.message as any)?.value || ''
-        mode = (fields.mode as any)?.value || 'rag'
-        sessionId = (fields.sessionId as any)?.value || ''
-        modelProvider = (fields.modelProvider as any)?.value || ''
-        modelName = (fields.modelName as any)?.value || ''
-        userId = (fields.userId as any)?.value || ''
+      // Parse multipart fields reliably (even when there's no file).
+      if (typeof request.isMultipart === 'function' && request.isMultipart()) {
+        const parts = request.parts()
+        for await (const part of parts) {
+          if (part.type === 'file') {
+            // File upload is currently not used by the python service in this endpoint.
+            // Consume stream to avoid hanging the request.
+            try {
+              await part.toBuffer()
+            } catch {
+              // ignore
+            }
+            continue
+          }
+          const fieldname = String(part.fieldname || '')
+          const value = String(part.value ?? '')
+          if (fieldname === 'message') message = value
+          else if (fieldname === 'mode') mode = value || 'rag'
+          else if (fieldname === 'sessionId') sessionId = value
+          else if (fieldname === 'modelProvider') modelProvider = value
+          else if (fieldname === 'modelName') modelName = value
+          else if (fieldname === 'userId') userId = value
+        }
+      } else {
+        const body = (request.body as any) || {}
+        message = body.message || body.question || ''
+        mode = body.mode || 'rag'
+        sessionId = body.sessionId || ''
+        modelProvider = body.modelProvider || ''
+        modelName = body.modelName || ''
+        userId = body.userId || ''
       }
 
+      if (!message) {
+        return { sessionId: sessionId || `${mode}_${uuidv4()}`, answer: '请输入您的健康问题', sources: [], trace: [] }
+      }
+
+      const effectiveUserId = (userId || '').trim() || DEFAULT_USER_ID
       const sid = sessionId || `${mode}_${uuidv4()}`
 
       const pythonEndpoint = mode === 'agent'
@@ -37,7 +64,7 @@ export default async function chatRoutes(fastify: FastifyInstance) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           session_id: sid,
-          user_id: userId || undefined,
+          user_id: effectiveUserId,
           message,
           question: message,
           model_provider: modelProvider || undefined,
@@ -76,7 +103,7 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       const useGraph = body?.useGraph
       const modelProvider = body?.modelProvider
       const modelName = body?.modelName
-      const userId = body?.userId
+      const userId = (body?.userId || '').trim() || DEFAULT_USER_ID
 
       if (!message) {
         return reply.send({ error: 'message is required' })

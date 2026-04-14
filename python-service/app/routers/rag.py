@@ -8,6 +8,7 @@ router = APIRouter()
 
 # 全局RAG引擎实例
 rag_engine = LocalDocQA()
+DEFAULT_USER_ID = "anonymous"
 
 
 @router.post("/rag")
@@ -21,19 +22,29 @@ async def rag_query(request: Request):
         use_graph = data.get("use_graph", data.get("useGraph", True))
         model_provider = data.get("model_provider")
         model_name = data.get("model_name")
+        user_id = data.get("user_id") or data.get("userId") or DEFAULT_USER_ID
 
         if not question:
             return {"answer": "请输入您的健康问题", "sources": []}
 
-        result = await rag_engine.query(
+        # For non-stream calls, we also persist to session storage.
+        # We reuse the stream pipeline (persist=True) but consume events to build the final response.
+        answer_parts = []
+        sources = []
+        async for evt in rag_engine.query_stream(
             question,
             session_id,
             chat_history,
             use_graph=bool(use_graph),
+            user_id=user_id,
             model_provider=model_provider,
             model_name=model_name,
-        )
-        return result
+        ):
+            if evt.get("type") == "token":
+                answer_parts.append(evt.get("content") or "")
+            elif evt.get("type") == "sources":
+                sources = evt.get("content") or []
+        return {"answer": "".join(answer_parts), "sources": sources}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -56,6 +67,7 @@ async def rag_query_stream(request: Request):
         async def event_generator():
             # 先产出一个事件，确保客户端尽快收到响应头并开始渲染（避免初始化耗时导致“无输出”假象）
             yield f"data: {json.dumps({'type': 'thinking', 'content': '🚀 请求已接收，正在准备检索与生成...'}, ensure_ascii=False)}\n\n"
+            uid = data.get("user_id") or data.get("userId") or DEFAULT_USER_ID
             async for chunk in rag_engine.query_stream(
                 question,
                 session_id,
@@ -63,7 +75,7 @@ async def rag_query_stream(request: Request):
                 use_graph=bool(use_graph),
                 model_provider=model_provider,
                 model_name=model_name,
-                user_id=data.get("user_id") or data.get("userId"),
+                user_id=uid,
             ):
                 event_data = json.dumps(chunk, ensure_ascii=False)
                 yield f"data: {event_data}\n\n"

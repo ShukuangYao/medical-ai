@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Dict, AsyncGenerator, Any, Optional, List, Tuple
 import asyncio
 import json
+import re
 
 from autogen import ConversableAgent
 
@@ -62,6 +63,7 @@ class MedicalAgentOrchestrator:
             "2) 不要编造：缺失信息要放入 missing_fields/空字符串/空数组。\n"
             "3) 如存在矛盾或不合理处，明确列出。\n"
             "4) 医疗建议必须保守、以就医与检查为导向，避免具体处方与剂量。\n"
+            "5) 禁止捏造用户画像：不得凭空补全年龄/性别/妊娠/基础病/用药/检查结果等个体事实；只能使用输入文本或明确给定的结构化字段。\n"
         )
 
         intent_agent = ConversableAgent(
@@ -153,6 +155,30 @@ class MedicalAgentOrchestrator:
                 except Exception:
                     return {}
             return {}
+
+    @staticmethod
+    def _has_unseen_patient_facts(*, raw: str, text: str) -> bool:
+        """Detect common patient-specific facts that appear in text but not in raw input.
+
+        This is a lightweight guardrail to reduce hallucinated demographics/conditions
+        from being amplified by downstream prompts.
+        """
+        r = (raw or "").strip()
+        t = (text or "").strip()
+        if not r or not t:
+            return False
+
+        patterns = [
+            r"\b\d{1,3}\s*岁\b",
+            r"\b(男|女)\b",
+            r"(透析|血液透析|腹膜透析)",
+            r"(孕|妊娠|哺乳)",
+            r"(高血压|糖尿病|冠心病|肾衰|肾功能不全|心衰|房颤|脑梗|卒中)",
+        ]
+        for p in patterns:
+            if re.search(p, t) and not re.search(p, r):
+                return True
+        return False
 
     def _build_fallback_report(
         self,
@@ -326,14 +352,34 @@ class MedicalAgentOrchestrator:
         """
         # 清空历史
         self.conversation_history = []
+        thinking_steps: List[str] = []
+
+        def _thinking(content: str) -> Dict[str, Any]:
+            thinking_steps.append(content)
+            return {"type": "thinking", "content": content}
 
         # 创建智能体
         agents = self._create_agents(provider=model_provider, model_name=model_name)
 
-        yield {"type": "thinking", "content": "开始多智能体病历分析..."}
+        yield _thinking("开始多智能体病历分析...")
 
         try:
             raw_question = medical_record.strip()
+
+            # Recover recent session history (minimal context engineering; avoid feeding huge history)
+            recent_history: List[Dict[str, str]] = []
+            if user_id:
+                try:
+                    rows = self.session_store.list_messages(
+                        session_id=session_id,
+                        user_id=user_id,
+                        mode="agent",
+                        limit=12,
+                    )
+                    # Keep only plain role/content, and keep the tail to reduce drift
+                    recent_history = [{"role": m.role, "content": m.content} for m in rows][-8:]
+                except Exception:
+                    recent_history = []
 
             # Persist user message
             if user_id:
@@ -348,10 +394,10 @@ class MedicalAgentOrchestrator:
                         content=raw_question,
                     )
                 except Exception as e:
-                    yield {"type": "thinking", "content": f"⚠️ 会话写入失败: {e}"}
+                    yield _thinking(f"⚠️ 会话写入失败: {e}")
 
             # 1) Intent (fast path: existing classifier)
-            yield {"type": "thinking", "content": "意图识别与问题消解..."}
+            yield _thinking("意图识别与问题消解...")
             intent_res = await self.intent_classifier.classify(raw_question)
             intent_payload = {
                 "raw_question": raw_question,
@@ -362,8 +408,62 @@ class MedicalAgentOrchestrator:
             yield {"type": "intent", "content": intent_payload}
             self.conversation_history.append({"agent": "IntentAgent", "message": json.dumps(intent_payload, ensure_ascii=False)})
 
+            # Guardrail: refuse non-relevant questions in Agent (medical record analysis) mode.
+            # For chit-chat / non-medical, direct users to the RAG tab.
+            intent_type = str(intent_res.get("intent") or intent_payload.get("intent_type") or "")
+            if intent_type in {"out_of_scope", "greeting", "thanks"}:
+                summary = (
+                    "当前问题不属于“病历分析”范畴（更像普通问答/闲聊/非医疗问题）。\n"
+                    "为避免误导，我不会在病历分析模式下回答。\n\n"
+                    "请切换到「普通问答（RAG）」Tab 再提问；如果你想做病历分析，请粘贴病历文本/症状描述/检查结果等。\n"
+                    "（结果仅供参考，不能替代专业医生的诊断与建议。）"
+                )
+                report = self._build_fallback_report(
+                    validated_record={},
+                    intent=intent_payload,
+                    structured_case={},
+                    symptom_analysis={},
+                    triage={},
+                    department={},
+                    next_steps={},
+                    treatment_safety={},
+                    summary=summary,
+                )
+                self._ensure_summary_minimum(report)
+                yield {"type": "result", "content": report}
+                if user_id:
+                    try:
+                        import uuid
+                        self.session_store.add_message(
+                            message_id=str(uuid.uuid4()),
+                            session_id=session_id,
+                            user_id=user_id,
+                            mode="agent",
+                            role="assistant",
+                            content=str(report.get("summary") or ""),
+                            report=report,
+                            sources=None,
+                            trace=report.get("trace") if isinstance(report, dict) else None,
+                            thinking_steps=thinking_steps if thinking_steps else None,
+                        )
+                    except Exception:
+                        pass
+                yield {"type": "done", "content": ""}
+                return
+
+            history_brief = ""
+            if recent_history:
+                lines = []
+                for h in recent_history:
+                    role = "用户" if h.get("role") == "user" else "助手"
+                    content = (h.get("content") or "").strip()
+                    if content:
+                        lines.append(f"- {role}: {content[:120]}")
+                if lines:
+                    history_brief = "最近会话摘要（仅供参考，优先以本次输入为准）：\n" + "\n".join(lines) + "\n\n"
+
             # 2) Validate & normalize record
-            yield {"type": "thinking", "content": "病历验证与纠错..."}
+            yield _thinking("病历验证与纠错...")
             validator_prompt = (
                 "输入为用户给出的病历/描述。请输出 JSON：\n"
                 "{\n"
@@ -372,6 +472,9 @@ class MedicalAgentOrchestrator:
                 '  "contradictions": ["矛盾/不一致..."],\n'
                 '  "corrections": ["纠错/规范化说明..."]\n'
                 "}\n\n"
+                "约束：\n"
+                "- normalized_text 只能对原文做“同义替换/单位规范化/纠错/断句”，不得新增任何个人信息或病史事实（例如年龄、性别、透析、高血压等）。\n\n"
+                f"{history_brief}"
                 f"原文：\n{raw_question}\n"
             )
             validator_text = await self._agent_reply(agents["validator"], validator_prompt)
@@ -380,9 +483,13 @@ class MedicalAgentOrchestrator:
             self.conversation_history.append({"agent": "RecordValidator", "message": validator_text})
 
             normalized_text = str(validated_record.get("normalized_text") or raw_question)
+            if self._has_unseen_patient_facts(raw=raw_question, text=normalized_text):
+                # Prevent downstream amplification: fall back to raw text when validator hallucinates facts.
+                yield _thinking("⚠️ 检测到规范化文本疑似新增个人事实，已回退使用原文继续分析。")
+                normalized_text = raw_question
 
             # 3) Structured extraction
-            yield {"type": "thinking", "content": "结构化抽取关键信息..."}
+            yield _thinking("结构化抽取关键信息...")
             extractor_prompt = (
                 "请从病历文本抽取结构化信息，输出 JSON：\n"
                 "{\n"
@@ -395,6 +502,8 @@ class MedicalAgentOrchestrator:
                 '  "allergies": ["..."],\n'
                 '  "tests": [ { "name": "...", "value": "...", "unit": "...", "note": "..." } ]\n'
                 "}\n\n"
+                "约束：\n"
+                "- 只抽取原文中明确出现的信息；原文未提到的字段填空字符串/空数组/空对象。\n\n"
                 f"病历文本：\n{normalized_text}\n"
             )
             extractor_text = await self._agent_reply(agents["extractor"], extractor_prompt)
@@ -403,12 +512,12 @@ class MedicalAgentOrchestrator:
             self.conversation_history.append({"agent": "SymptomExtractor", "message": extractor_text})
 
             # 4) Evidence retrieval (grounding)
-            yield {"type": "thinking", "content": "检索参考资料（用于依据与下一步建议）..."}
+            yield _thinking("检索参考资料（用于依据与下一步建议）...")
             # Build a stable, medical-record-grounded retrieval query to avoid drifting to irrelevant docs.
             symptoms = structured_case.get("symptoms") if isinstance(structured_case, dict) else None
             symptom_text = "；".join([s for s in (symptoms or []) if isinstance(s, str) and s.strip()][:6])
             retrieval_query_parts = [
-                str(validated_record.get("normalized_text") or "").strip(),
+                raw_question,
                 str(structured_case.get("chief_complaint") or "").strip() if isinstance(structured_case, dict) else "",
                 symptom_text,
                 str(intent_res.get("entity") or "").strip(),
@@ -419,15 +528,20 @@ class MedicalAgentOrchestrator:
                 yield {"type": "sources", "content": sources}
 
             # 5) Symptom analysis / possible conditions
-            yield {"type": "thinking", "content": "病症分析与鉴别诊断候选..."}
+            yield _thinking("病症分析与鉴别诊断候选...")
             analyst_prompt = (
                 "请基于结构化病历与参考资料，输出 JSON：\n"
                 "{\n"
                 '  "key_findings": ["关键发现..."],\n'
                 '  "possible_conditions": ["可能疾病/问题（不要确诊）..."]\n'
                 "}\n\n"
+                "约束：\n"
+                "- 不能把参考资料中的“某个病例/某个患者”的人口学信息当作用户事实。\n"
+                "- 用户画像（年龄/性别/基础病/用药/检查结果）只能来自原文或结构化病历；缺失则保持未知。\n\n"
                 f"结构化病历：\n{json.dumps(structured_case, ensure_ascii=False)}\n\n"
-                f"参考资料摘要：\n{sources_brief}\n"
+                f"参考资料摘要：\n{sources_brief}\n\n"
+                "要求：\n"
+                "- 只能基于病历与参考资料，不要凭空引入未出现的新疾病名\n"
             )
             analyst_text = await self._agent_reply(agents["analyst"], analyst_prompt)
             symptom_analysis = self._safe_json(analyst_text)
@@ -435,7 +549,7 @@ class MedicalAgentOrchestrator:
             self.conversation_history.append({"agent": "ConditionAnalyst", "message": analyst_text})
 
             # 6) Triage
-            yield {"type": "thinking", "content": "紧急程度评估与红旗征..."}
+            yield _thinking("紧急程度评估与红旗征...")
             triage_prompt = (
                 "请根据病历判断紧急程度，输出 JSON：\n"
                 "{\n"
@@ -451,7 +565,7 @@ class MedicalAgentOrchestrator:
             self.conversation_history.append({"agent": "TriageNurse", "message": triage_text})
 
             # 7) Department
-            yield {"type": "thinking", "content": "推荐就诊科室..."}
+            yield _thinking("推荐就诊科室...")
             dept_prompt = (
                 "请输出 JSON：\n"
                 "{\n"
@@ -467,7 +581,7 @@ class MedicalAgentOrchestrator:
             self.conversation_history.append({"agent": "DepartmentRecommender", "message": dept_text})
 
             # 8) Next steps
-            yield {"type": "thinking", "content": "制定下一步举措..."}
+            yield _thinking("制定下一步举措...")
             planner_prompt = (
                 "请输出 JSON：\n"
                 "{\n"
@@ -488,7 +602,7 @@ class MedicalAgentOrchestrator:
             self.conversation_history.append({"agent": "NextStepPlanner", "message": planner_text})
 
             # 9) Safety check
-            yield {"type": "thinking", "content": "安全性审阅与禁忌提醒..."}
+            yield _thinking("安全性审阅与禁忌提醒...")
             safety_prompt = (
                 "请输出 JSON：\n"
                 "{\n"
@@ -504,7 +618,7 @@ class MedicalAgentOrchestrator:
             self.conversation_history.append({"agent": "SafetyCritic", "message": safety_text})
 
             # 10) Coordinator merge
-            yield {"type": "thinking", "content": "汇总生成最终结构化报告..."}
+            yield _thinking("汇总生成最终结构化报告...")
             coordinator_prompt = (
                 "请把以下模块结果合并为最终 JSON，字段必须完全包含：\n"
                 "{\n"
@@ -522,6 +636,10 @@ class MedicalAgentOrchestrator:
                 "请确保：\n"
                 "- severity_level 只能是 emergency/urgent/routine\n"
                 "- 缺失字段用空字符串/空数组/空对象，不要省略键\n\n"
+                "重要约束（防幻觉）：\n"
+                "- 不得捏造用户画像：年龄/性别/妊娠/基础病/用药/检查结果等个体事实只能来自【原文】或上游结构化结果中明确来自原文的字段；不确定就不要写。\n"
+                "- 参考资料仅用于通用医学依据，不能把其中的“某病例/某患者”信息当作用户事实。\n\n"
+                f"原文={raw_question}\n"
                 f"validated_record={json.dumps(validated_record, ensure_ascii=False)}\n"
                 f"intent={json.dumps(intent_payload, ensure_ascii=False)}\n"
                 f"structured_case={json.dumps(structured_case, ensure_ascii=False)}\n"
@@ -562,6 +680,15 @@ class MedicalAgentOrchestrator:
                 self._ensure_summary_minimum(report)
             # also ensure summary for fallback path
             self._ensure_summary_minimum(report)
+
+            # Final hallucination guard for the user-facing summary.
+            try:
+                summary_text = str(report.get("summary") or "")
+                if summary_text and self._has_unseen_patient_facts(raw=raw_question, text=summary_text):
+                    report["summary"] = "病历信息不足，建议补充关键病史与检查结果后再评估（结果仅供参考，不能替代专业医生的诊断与建议）。"
+            except Exception:
+                pass
+
             yield {"type": "result", "content": report}
             # Persist assistant message (summary + report)
             if user_id:
@@ -577,6 +704,7 @@ class MedicalAgentOrchestrator:
                         report=report,
                         sources=sources if sources else None,
                         trace=report.get("trace") if isinstance(report, dict) else None,
+                        thinking_steps=thinking_steps if thinking_steps else None,
                     )
                 except Exception:
                     pass

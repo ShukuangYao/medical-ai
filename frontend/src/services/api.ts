@@ -4,7 +4,8 @@ import { createSSEConnection } from './sseClient'
 
 const api = axios.create({
   baseURL: '/api',
-  timeout: 30000,
+  // Non-stream requests can be slow (model + retrieval). Streaming uses fetch/SSE, not this timeout.
+  timeout: 120000,
 })
 
 export interface StreamCallbacks {

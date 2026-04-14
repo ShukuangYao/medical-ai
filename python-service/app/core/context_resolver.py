@@ -1,16 +1,14 @@
 """上下文指代消解器 - 处理"它"、"这个病"、"刚才的"等指代"""
-from typing import List, Dict, Optional
-from openai import AsyncOpenAI
-import os
+from typing import Dict, List, Optional
 
 
 class ContextResolver:
     """上下文指代消解器"""
 
-    def __init__(self, llm=None):
+    def __init__(self, llm):
+        # Force using the project OpenAI-compatible client (DashScope/DeepSeek).
+        # This avoids hidden dependency on OPENAI_API_KEY.
         self.llm = llm
-        if not self.llm:
-            self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
     async def resolve_query(
         self, current_query: str, chat_history: List[Dict[str, str]]
@@ -43,6 +41,15 @@ class ContextResolver:
         if not query:
             return False
 
+        # Fast exit for pure greetings/thanks: they do not need coreference or follow-up completion.
+        small_talk = {
+            "谢谢", "谢了", "多谢", "感谢", "非常感谢",
+            "好的", "好", "嗯", "OK", "ok",
+            "你好", "您好", "嗨", "在吗",
+        }
+        if query in small_talk:
+            return False
+
         pronouns = ["它", "这个", "那个", "刚才", "上面", "之前", "该", "此", "这个病", "这个情况"]
         if any(p in query for p in pronouns):
             return True
@@ -70,44 +77,35 @@ class ContextResolver:
         # - 涉及“最初/最早/一开始”：首轮用户问题 + 最近2轮，避免被近期话题覆盖
         history_for_resolve = self._build_history_for_resolution(query, history)
         history_text = "\n".join([
-            f"{'用户' if h['role'] == 'user' else '助手'}: {h['content'][:100]}"
+            f"{'用户' if h['role'] == 'user' else '助手'}: {h['content'][:200]}"
             for h in history_for_resolve
         ])
 
-        prompt = f"""你是一个上下文理解助手。用户在多轮对话中可能使用指代词（如"它"、"这个病"、"刚才的"等）。
+        prompt = f"""你是一个上下文理解助手。用户在多轮对话中可能使用指代词（如"它"、"这个病"、"刚才的"等），也可能省略主语直接追问（例如“挂什么科”“怎么治疗”“严重吗”）。
 
 对话历史：
 {history_text}
 
 当前问题：{query}
 
-请将当前问题中的指代词替换为具体的实体，输出完整的问题。
+请输出“补全后的完整问题”。你需要同时处理两类情况：
+1) 指代消解：把指代词替换为历史中明确出现过的具体实体
+2) 追问补全：若当前问题是省略主语的追问（例如“挂什么科/怎么治/严重吗”），且历史中只有一个清晰的主题实体（疾病/症状/药物/检查），则把该实体补全进问题（例如把“挂什么科”补全为“高烧挂什么科”）
 
 要求：
 1. 只输出消解后的完整问题，不要解释
-2. 如果没有指代词，直接输出原问题
+2. 若当前问题本身已完整且不需要补全，直接输出原问题
 3. 确保消解后的问题语义完整、清晰
 4. 只能使用“对话历史”中已经明确出现过的疾病/症状/药物/检查等实体，严禁凭空引入新实体或新疾病名称
 5. 如果当前问题明确指向多个实体（例如“这两个病/这些病”），请把这些实体都补全在问题里；若历史中无法确定是哪几个实体，则保留原问题并在问题末尾补充“（请明确指的是哪些疾病/症状）”
 
 消解后的问题："""
 
-        if self.llm:
-            # 使用传入的LLM
-            messages = [{"role": "user", "content": prompt}]
-            response = ""
-            async for token in self.llm.generate_stream(messages):
-                response += token
-            return response.strip()
-        else:
-            # 使用OpenAI API
-            response = await self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=100,
-            )
-            return response.choices[0].message.content.strip()
+        messages = [{"role": "user", "content": prompt}]
+        response = ""
+        async for token in self.llm.generate_stream(messages, temperature=0.3, max_tokens=100):
+            response += token
+        return response.strip()
 
     def _build_history_for_resolution(
         self, query: str, history: List[Dict[str, str]]
@@ -147,16 +145,8 @@ class ContextResolver:
         if self.llm:
             messages = [{"role": "user", "content": prompt}]
             response = ""
-            async for token in self.llm.generate_stream(messages):
+            async for token in self.llm.generate_stream(messages, temperature=0.1, max_tokens=20):
                 response += token
             entity = response.strip()
-        else:
-            response = await self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=20,
-            )
-            entity = response.choices[0].message.content.strip()
 
         return entity if entity and entity != "无" else None

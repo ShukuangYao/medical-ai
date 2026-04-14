@@ -29,24 +29,26 @@ export const sessionsAPI = {
     return res.data.sessions
   },
 
-  getMessages: async (params: { userId: string; sessionId: string }) => {
+  getMessages: async (params: { userId: string; sessionId: string; mode: ChatMode }) => {
     const res = await api.get<{ messages: Array<Omit<Message, 'thinkingExpanded'> & { createdAt: string }> }>(
       `/sessions/${params.sessionId}/messages`,
-      { params: { userId: params.userId } }
+      { params: { userId: params.userId, mode: params.mode } }
     )
     return res.data.messages
   },
 
-  renameSession: async (params: { userId: string; sessionId: string; title: string }) => {
+  renameSession: async (params: { userId: string; sessionId: string; mode: ChatMode; title: string }) => {
     await api.post(`/sessions/${params.sessionId}/rename`, {
       userId: params.userId,
+      mode: params.mode,
       title: params.title,
     })
   },
 
-  archiveSession: async (params: { userId: string; sessionId: string; archived?: boolean }) => {
+  archiveSession: async (params: { userId: string; sessionId: string; mode: ChatMode; archived?: boolean }) => {
     await api.post(`/sessions/${params.sessionId}/archive`, {
       userId: params.userId,
+      mode: params.mode,
       archived: params.archived !== false,
     })
   },

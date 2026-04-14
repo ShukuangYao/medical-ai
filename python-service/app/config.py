@@ -79,6 +79,7 @@ class Settings:
     # Token管理
     MAX_CONTEXT_TOKENS = 3000  # 上下文最大Token数
     MAX_OUTPUT_TOKENS = 1024  # 生成最大Token数
+    MAX_HISTORY_TOKENS = int(os.getenv("MAX_HISTORY_TOKENS", "800"))  # 历史对话窗口最大Token数（估算）
 
     # 文档切片配置
     CHUNK_SIZE = 500

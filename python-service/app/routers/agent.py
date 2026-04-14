@@ -8,6 +8,7 @@ import json
 
 router = APIRouter()
 agent_orchestrator = None
+DEFAULT_USER_ID = "anonymous"
 
 @router.on_event("startup")
 async def startup():
@@ -29,12 +30,13 @@ async def agent_diagnose_stream(request: ChatRequest):
 
     async def generate():
         try:
+            uid = request.user_id or DEFAULT_USER_ID
             async for chunk in agent_orchestrator.diagnose_stream(
                 request.message,
                 request.session_id or "default",
                 model_provider=request.model_provider,
                 model_name=request.model_name,
-                user_id=request.user_id,
+                user_id=uid,
             ):
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         except Exception as e:
@@ -52,9 +54,14 @@ async def agent_diagnose(request: ChatRequest):
     try:
         trace = []
         report = None
+        uid = request.user_id or DEFAULT_USER_ID
 
         async for chunk in agent_orchestrator.diagnose_stream(
-            request.message, request.session_id or "default"
+            request.message,
+            request.session_id or "default",
+            model_provider=request.model_provider,
+            model_name=request.model_name,
+            user_id=uid,
         ):
             if chunk["type"] == "agent_step":
                 c = chunk.get("content") or {}

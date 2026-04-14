@@ -109,7 +109,12 @@ function ChatBox({ mode }: ChatBoxProps) {
     if (flush && tokenQueueRef.current.length > 0) {
       streamContentRef.current += tokenQueueRef.current.join('')
       tokenQueueRef.current = []
-      useChatStore.getState().updateMessageById(assistantMsgIdRef.current, (msg) => ({ ...msg, content: streamContentRef.current }))
+      useChatStore
+        .getState()
+        .updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, assistantMsgIdRef.current, (msg) => ({
+          ...msg,
+          content: streamContentRef.current,
+        }))
     }
     isDoneRef.current = false
   }, [])
@@ -121,12 +126,22 @@ function ChatBox({ mode }: ChatBoxProps) {
       if (tokenQueueRef.current.length > 0) {
         const chars = tokenQueueRef.current.splice(0, 3).join('')
         streamContentRef.current += chars
-        useChatStore.getState().updateMessageById(assistantMsgIdRef.current, (msg) => ({ ...msg, content: streamContentRef.current }))
+        useChatStore
+          .getState()
+          .updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, assistantMsgIdRef.current, (msg) => ({
+            ...msg,
+            content: streamContentRef.current,
+          }))
       } else if (isDoneRef.current) {
         clearInterval(typewriterTimerRef.current!)
         typewriterTimerRef.current = null
         isDoneRef.current = false
-        useChatStore.getState().updateMessageById(assistantMsgIdRef.current, (msg) => ({ ...msg, thinkingExpanded: false }))
+        useChatStore
+          .getState()
+          .updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, assistantMsgIdRef.current, (msg) => ({
+            ...msg,
+            thinkingExpanded: false,
+          }))
         useChatStore.getState().setLoadingForMode(requestModeRef.current, false)
         useChatStore.getState().checkAndSummarizeForMode(requestModeRef.current)
       }

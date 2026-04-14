@@ -164,7 +164,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   renameSession: async (mode, sessionId, title) => {
     const { userId } = get()
-    await sessionsAPI.renameSession({ userId, sessionId, title })
+    await sessionsAPI.renameSession({ userId, sessionId, mode, title })
     set((s) => ({
       sessions: {
         ...s.sessions,
@@ -175,7 +175,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   archiveSession: async (mode, sessionId) => {
     const { userId } = get()
-    await sessionsAPI.archiveSession({ userId, sessionId })
+    await sessionsAPI.archiveSession({ userId, sessionId, mode })
     set((s) => {
       const { [sessionId]: _removed, ...restBySession } = s.messagesBySession[mode]
       return { messagesBySession: { ...s.messagesBySession, [mode]: restBySession } }
@@ -186,7 +186,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setActiveSession: async (mode, sessionId) => {
     const { userId } = get()
     const cached = get().messagesBySession[mode][sessionId]
-    const msgs = cached ?? (await sessionsAPI.getMessages({ userId, sessionId }))
+    const msgs = cached ?? (await sessionsAPI.getMessages({ userId, sessionId, mode }))
     set((s) => ({
       activeSessionIdByMode: { ...s.activeSessionIdByMode, [mode]: sessionId },
       messagesBySession: {

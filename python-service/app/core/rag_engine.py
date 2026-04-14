@@ -25,6 +25,8 @@ from app.core.intent_router import IntentRouter
 from app.core.memory_manager import MemoryManager
 from app.core.context_resolver import ContextResolver
 from app.core.session_store import SessionStore
+from app.core.context_builder import ContextBuilder
+from app.core.telemetry import Telemetry
 
 
 class LocalDocQA:
@@ -232,13 +234,21 @@ class LocalDocQA:
         - `query_stream()` 直接转发这些事件到 SSE。
         - `query()` 通过消费 token 事件拼接成最终 answer。
         """
+        tel = Telemetry()
+        tel.start("rag_total")
+        thinking_steps: List[str] = []
+
+        def _thinking(content: str) -> Dict:
+            thinking_steps.append(content)
+            return {"type": "thinking", "content": content}
+
         if not self.initialized:
             if emit_thinking:
                 # 先吐出一个事件，避免初始化耗时导致客户端长时间“无输出”
-                yield {"type": "thinking", "content": "⏳ 正在初始化检索与模型组件，请稍候..."}
+                yield _thinking("⏳ 正在初始化检索与模型组件，请稍候...")
             await self.initialize()
             if emit_thinking:
-                yield {"type": "thinking", "content": "✅ 初始化完成，开始处理请求..."}
+                yield _thinking("✅ 初始化完成，开始处理请求...")
 
         # 记忆/会话持久化：仅在流式链路（或显式需要）时启用，避免非流式副作用
         if persist:
@@ -257,6 +267,19 @@ class LocalDocQA:
                     self.memory_manager.short_term.add_message(session_id, "user", question)
                 except Exception as e:
                     print(f"保存短期记忆失败（Redis可能未启动）: {e}")
+
+            # 会话存储：优先从 SQLite 恢复历史（作为事实源）；仅在请求未显式传入 chat_history 时启用
+            if (not chat_history) and user_id and self.session_store:
+                try:
+                    rows = self.session_store.list_messages(
+                        session_id=session_id,
+                        user_id=user_id,
+                        mode="rag",
+                        limit=50,
+                    )
+                    chat_history = [{"role": m.role, "content": m.content} for m in rows]
+                except Exception as e:
+                    print(f"从会话存储恢复历史失败: {e}")
 
             # 会话存储：写入用户消息
             if user_id and self.session_store:
@@ -279,17 +302,21 @@ class LocalDocQA:
         resolved_question = question
         if chat_history and len(chat_history) >= 2 and self.context_resolver:
             if emit_thinking:
-                yield {"type": "thinking", "content": "🔗 正在消解上下文指代..."}
+                yield _thinking("🔗 正在消解上下文指代...")
             resolved_question, _extracted_entity = await self.context_resolver.resolve_query(question, chat_history)
             if resolved_question != question:
                 if emit_thinking:
-                    yield {"type": "thinking", "content": f"✓ 消解后: {resolved_question}"}
+                    yield _thinking(f"✓ 消解后: {resolved_question}")
                 question = resolved_question
 
         # 步骤1：意图识别
         if emit_thinking:
-            yield {"type": "thinking", "content": "🤔 正在分析问题意图..."}
+            yield _thinking("🤔 正在分析问题意图...")
+        tel.start("intent_classify")
         intent_result = await self.intent_classifier.classify(question)
+        intent_evt = tel.end("intent_classify", intent=intent_result.get("intent"), confidence=float(intent_result.get("confidence", 0.0)))
+        if emit_thinking and intent_evt:
+            yield _thinking(f"⏱️ intent_classify: {intent_evt['duration_ms']}ms")
         if not use_graph:
             intent_result["use_graph"] = False
 
@@ -311,14 +338,19 @@ class LocalDocQA:
                 "type": "thinking",
                 "content": f"✓ 识别意图: {intent_desc} (置信度: {intent_result['confidence']:.0%})",
             }
+            thinking_steps.append(f"✓ 识别意图: {intent_desc} (置信度: {intent_result['confidence']:.0%})")
 
         # 步骤1.5：问题改写（仅对需要检索的意图）
         if intent_result["intent"] not in ["greeting", "thanks", "out_of_scope"]:
             if emit_thinking:
-                yield {"type": "thinking", "content": "🔄 正在优化问题表述..."}
+                yield _thinking("🔄 正在优化问题表述...")
+            tel.start("rewrite")
             rewritten_question = await self.rewrite_chain.rewrite(question, chat_history)
+            rw_evt = tel.end("rewrite")
+            if emit_thinking and rw_evt:
+                yield _thinking(f"⏱️ rewrite: {rw_evt['duration_ms']}ms")
             if rewritten_question != question and emit_thinking:
-                yield {"type": "thinking", "content": f"✓ 问题改写: {rewritten_question}"}
+                yield _thinking(f"✓ 问题改写: {rewritten_question}")
         else:
             rewritten_question = question
 
@@ -332,9 +364,9 @@ class LocalDocQA:
         # 步骤2-3：意图路由（检索+重排序）
         if emit_thinking:
             if use_graph and intent_result["use_graph"]:
-                yield {"type": "thinking", "content": "🔍 正在查询知识图谱..."}
+                yield _thinking("🔍 正在查询知识图谱...")
             else:
-                yield {"type": "thinking", "content": "🔍 正在检索相关文档..."}
+                yield _thinking("🔍 正在检索相关文档...")
 
         reranked, _route_strategy = await self.intent_router.route(
             intent_result,
@@ -346,25 +378,44 @@ class LocalDocQA:
             if reranked:
                 graph_count = sum(1 for d in reranked if d.get("retrieval_source") == "graph")
                 vector_count = len(reranked) - graph_count
-                yield {"type": "thinking", "content": f"✓ 检索完成: 图谱{graph_count}条, 向量{vector_count}条"}
-                yield {"type": "thinking", "content": "⚡ 正在重排序优化结果..."}
+                yield _thinking(f"✓ 检索完成: 图谱{graph_count}条, 向量{vector_count}条")
+                yield _thinking("⚡ 正在重排序优化结果...")
             else:
-                yield {"type": "thinking", "content": "⚠️ 未找到相关文档"}
+                yield _thinking("⚠️ 未找到相关文档")
 
         # 步骤4：上下文构建
-        context = self._build_context(reranked) if reranked else ""
+        builder = ContextBuilder()
+        tel.start("build_context")
+        context, ctx_stats = builder.build_retrieval_context(
+            reranked or [],
+            max_tokens=settings.MAX_CONTEXT_TOKENS,
+        )
+        ctx_evt = tel.end("build_context", **ctx_stats)
+        if emit_thinking and ctx_evt:
+            yield _thinking(f"⏱️ build_context: {ctx_evt['duration_ms']}ms")
         if emit_thinking and context:
-            yield {"type": "thinking", "content": f"📝 构建上下文: {len(context)}字符"}
+            yield _thinking(f"📝 构建上下文: {len(context)}字符")
         if emit_thinking:
-            yield {"type": "thinking", "content": "💡 正在生成回答...\n"}
+            yield _thinking(f"📦 上下文预算: {ctx_stats.get('context_tokens', 0)} tokens, 文档{ctx_stats.get('context_docs_included', 0)}条")
+        if emit_thinking:
+            yield _thinking("💡 正在生成回答...\n")
 
         # 步骤5：流式生成回答（两条链路共用，避免行为分叉）
         llm = OpenAILLM.from_provider(provider=model_provider, model_name=model_name)
         messages = llm.build_rag_messages(question, context, chat_history)
         full_answer = ""
+        first_token = True
+        tel.start("llm_stream")
         async for token in llm.generate_stream(messages):
+            if first_token:
+                first_token = False
+                if emit_thinking:
+                    yield _thinking("⏱️ 首 token 已返回")
             full_answer += token
             yield {"type": "token", "content": token}
+        llm_evt = tel.end("llm_stream", output_chars=len(full_answer))
+        if emit_thinking and llm_evt:
+            yield _thinking(f"⏱️ llm_stream: {llm_evt['duration_ms']}ms")
 
         # 步骤6：构建来源信息（用于回传与会话持久化）
         sources = [
@@ -404,11 +455,15 @@ class LocalDocQA:
                     role="assistant",
                     content=full_answer,
                     sources=sources,
+                    thinking_steps=thinking_steps if thinking_steps else None,
                 )
             except Exception as e:
                 print(f"写入会话消息失败: {e}")
 
         yield {"type": "sources", "content": sources}
+        total_evt = tel.end("rag_total")
+        if emit_thinking and total_evt:
+            yield _thinking(f"⏱️ total: {total_evt['duration_ms']}ms")
         yield {"type": "done", "content": ""}
 
     async def query(
