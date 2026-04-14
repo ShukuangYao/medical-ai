@@ -12,14 +12,18 @@
 ### 1. 配置环境变量
 
 ```bash
-cd medical-ai-demo
+cd medical-ai
 cp .env.example .env
 ```
 
 编辑 `.env` 文件，填入必要的配置：
 ```bash
-# 如果使用OpenAI API
-OPENAI_API_KEY=your_api_key_here
+# LLM 配置（默认使用 DashScope 的 OpenAI 兼容接口）
+DASHSCOPE_API_KEY=your_dashscope_api_key_here
+
+# 也支持 DeepSeek（优先级：DEEPSEEK_* > DASHSCOPE_*）
+# DEEPSEEK_API_KEY=your_deepseek_api_key_here
+# DEEPSEEK_API_BASE=https://api.deepseek.com
 
 # Neo4j密码
 NEO4J_PASSWORD=medical_demo_2025
@@ -33,7 +37,7 @@ docker-compose up --build
 
 ### 3. 访问系统
 
-- 前端界面：http://localhost:3000
+- 前端界面：http://localhost:3000（Docker Compose 方式的端口映射）
 - Node后端API：http://localhost:3001
 - Python AI服务：http://localhost:8000
 - Neo4j浏览器：http://localhost:7474
@@ -80,7 +84,7 @@ pnpm install
 pnpm run dev
 ```
 
-前端将在 http://localhost:3000 启动
+前端将在 http://localhost:3002 启动（本机 Vite dev server，见 `frontend/vite.config.ts`；`3000` 仅对应 compose 的容器端口映射）
 
 ## 功能说明
 

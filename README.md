@@ -6,7 +6,7 @@
 - **API 网关**：Node.js（Fastify）
 - **AI 服务**：Python（FastAPI），内含 RAG 引擎与 Agent 编排器
 
-> 本仓库中还有一个历史子项目 `RAGQnASystem/`，本文档聚焦 `medical-ai-demo/` 这一套可运行的前后端联调 Demo。
+> 本仓库中还有一个历史子项目 `RAGQnASystem/`，本文档聚焦 `medical-ai/` 这一套可运行的前后端联调 Demo。
 
 ## 快速开始（本机开发）
 
@@ -31,7 +31,7 @@
 1. 进入目录并准备环境变量：
 
 ```bash
-cd medical-ai-demo
+cd medical-ai
 cp .env.example .env
 ```
 
@@ -57,7 +57,7 @@ docker compose up -d
 #### 1) 启动 Python Service（8000）
 
 ```bash
-cd medical-ai-demo/python-service
+cd medical-ai/python-service
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -67,7 +67,7 @@ uvicorn app.main:app --reload --port 8000
 #### 2) 启动 Node Backend（3001）
 
 ```bash
-cd medical-ai-demo/node-backend
+cd medical-ai/node-backend
 pnpm install
 pnpm dev
 ```
@@ -77,7 +77,7 @@ Node 默认会把请求转发到 `PYTHON_SERVICE_URL`（默认 `http://localhost
 #### 3) 启动 Frontend（3002）
 
 ```bash
-cd medical-ai-demo/frontend
+cd medical-ai/frontend
 pnpm install
 pnpm dev
 ```
@@ -173,7 +173,7 @@ sequenceDiagram
 对应代码：
 
 - Node：`node-backend/src/routes/chat.ts` 中 `mode === 'agent'` → Python `POST /api/agent`
-- Python：`python-service/app/routers/agent.py` 汇总 `diagnose_stream`，返回 `answer + trace`
+- Python：`python-service/app/routers/agent.py` 汇总 `diagnose_stream`，通过 SSE 持续输出事件流（`thinking / intent / agent_step / sources / result / done`）
 
 ```mermaid
 sequenceDiagram
@@ -197,7 +197,7 @@ sequenceDiagram
 
 ## 各模块功能图
 
-### Frontend（`medical-ai-demo/frontend`）
+### Frontend（`medical-ai/frontend`）
 
 ```mermaid
 flowchart LR
@@ -219,7 +219,7 @@ flowchart LR
 
 
 
-### Node Backend（`medical-ai-demo/node-backend`）
+### Node Backend（`medical-ai/node-backend`）
 
 ```mermaid
 flowchart LR
@@ -232,7 +232,7 @@ flowchart LR
 
 
 
-### Python Service（`medical-ai-demo/python-service`）
+### Python Service（`medical-ai/python-service`）
 
 ```mermaid
 flowchart LR
@@ -276,14 +276,23 @@ RAG 可能会降级走 **Elasticsearch** 或其它检索来源；是否可用取
   - `LLM_API_BASE`: OpenAI 兼容接口的 `base_url`（如 DashScope 兼容地址、OneAPI 地址、本地 vLLM/ollama 的兼容地址）
   - `LLM_MODEL`: 模型名（默认 `qwen-turbo`）
 - **依赖服务（Python 侧）**：Milvus / Elasticsearch / Neo4j / Redis 的地址通常通过环境变量读取；参考：
-  - `medical-ai-demo/.env.example`
-  - `medical-ai-demo/docker-compose.yml`
+  - `medical-ai/.env.example`
+  - `medical-ai/docker-compose.yml`
 
 ## 变更记录（最近一次）
 
 - **Agent 流式链路对齐**：Node 的 `POST /api/chat/stream` 在 `mode=agent` 时已转发到 Python `POST /api/agent/stream`（SSE）。
 - **病历分析严格 JSON**：Python 输出 `report: AgentReport`（含意图、病历校验纠错、结构化抽取、紧急程度、科室、下一步举措、安全审阅等模块）。
 - **前端卡片展示**：病历分析结果会以卡片展示（紧急程度/科室/下一步举措），并保留过程日志与 sources。
+
+## 会话（Sessions）
+
+系统已支持会话管理与持久化（用于历史恢复与多轮对话连续性）：
+
+- **RAG / Agent 两套独立会话列表**：两种模式分别维护会话，互不干扰
+- **会话重命名 / 归档**：便于整理长期对话
+- **SQLite 会话持久化与历史恢复**：刷新页面或重启服务后仍可恢复历史
+- **默认自动创建会话**：首次进入对应模式会自动生成一个会话，无需手动新建
 
 涉及文件（节选）：
 
