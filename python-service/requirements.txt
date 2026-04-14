@@ -1,0 +1,28 @@
+# setuptools 82+ 移除了顶层 pkg_resources，旧版 pymilvus 会报错；与 pymilvus 的 setuptools>69 约束对齐
+setuptools>=69.0.0,<82.0.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.7.4
+# pymilvus 要求 python-dotenv>=1.0.1,<2.0.0，勿钉死 1.0.0
+python-dotenv>=1.0.1,<2.0.0
+langchain>=1.0.0
+langchain-openai>=0.1.0
+langchain-community>=0.0.20
+openai>=1.12.0
+pyautogen>=0.2.32
+neo4j==5.15.0
+redis==5.0.1
+# 嵌入模型和重排序（固定兼容版本）
+numpy>=1.24.0,<2.0          # numpy 2.x 与 torch 不兼容
+transformers>=4.40.0,<4.47.0 # 4.47+ 有 nn 未定义 bug
+sentence-transformers>=2.3.0,<3.0.0
+# 向量数据库（2.5+ 对 Python 3.12 / setuptools 更友好）
+pymilvus>=2.5.0
+# 全文检索
+elasticsearch>=8.0.0,<9.0.0
+# 数据集
+datasets>=2.16.0
+# Token计算
+tiktoken>=0.5.0
+# 流式输出
+sse-starlette>=1.8.0
