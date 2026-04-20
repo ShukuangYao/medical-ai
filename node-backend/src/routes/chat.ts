@@ -35,8 +35,18 @@ export default async function chatRoutes(fastify: FastifyInstance) {
   // 非流式聊天接口
   fastify.post('/chat', async (request: any, reply: any) => {
     const bodyForMeta = (request.body as any) || {}
+    const requestId: string = String(request.headers?.['x-request-id'] || '') || uuidv4()
+    const runId: string = String(request.headers?.['x-run-id'] || '') || uuidv4()
     const handler = traceable(
       async () => {
+      // Surface IDs to the browser for debugging/correlation (request headers are client-owned).
+      // Note: these are response headers for the browser -> node hop.
+      try {
+        reply.header('X-Request-ID', requestId)
+        reply.header('X-Run-Id', runId)
+      } catch {
+        // ignore header-setting failures
+      }
       let message = ''
       let mode = 'rag'
       let sessionId = ''
@@ -95,6 +105,11 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       const runTree = getCurrentRunTree() as any
       if (runTree && typeof runTree.toHeaders === 'function') Object.assign(lsHeaders, runTree.toHeaders())
 
+      const requestHeaders: Record<string, string> = {
+        'X-Request-ID': requestId,
+        'X-Run-Id': runId,
+      }
+
       const ap = (agentPipeline || '').trim().toLowerCase()
       const agent_pipeline = mode === 'agent' && (ap === 'full' || ap === 'fast') ? ap : undefined
 
@@ -109,7 +124,7 @@ export default async function chatRoutes(fastify: FastifyInstance) {
           model_name: modelName || undefined,
           ...(agent_pipeline ? { agent_pipeline } : {}),
         },
-        lsHeaders,
+        { ...lsHeaders, ...requestHeaders },
       )
 
       if (pyStatus < 200 || pyStatus >= 300) {
@@ -137,6 +152,8 @@ export default async function chatRoutes(fastify: FastifyInstance) {
           stream: false,
           session_id: bodyForMeta?.sessionId || null,
           user_id: bodyForMeta?.userId || null,
+          request_id: requestId,
+          run_id: runId,
         },
         processOutputs: (outputs) => sanitizeNodeChatTraceOutputs(outputs as Readonly<ChatResponse>),
       },
@@ -156,6 +173,8 @@ export default async function chatRoutes(fastify: FastifyInstance) {
 
   // SSE流式聊天接口
   fastify.post('/chat/stream', async (request: any, reply: any) => {
+    const requestId: string = String(request.headers?.['x-request-id'] || '') || uuidv4()
+    const runId: string = String(request.headers?.['x-run-id'] || '') || uuidv4()
     const handler = traceable(
       async () => {
       const body = request.body as any
@@ -181,6 +200,11 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       const runTree = getCurrentRunTree() as any
       if (runTree && typeof runTree.toHeaders === 'function') Object.assign(lsHeaders, runTree.toHeaders())
 
+      const requestHeaders: Record<string, string> = {
+        'X-Request-ID': requestId,
+        'X-Run-Id': runId,
+      }
+
       const agent_pipeline =
         mode === 'agent' && (agentPipeline === 'full' || agentPipeline === 'fast') ? agentPipeline : undefined
 
@@ -197,7 +221,7 @@ export default async function chatRoutes(fastify: FastifyInstance) {
           model_name: modelName,
           ...(agent_pipeline ? { agent_pipeline } : {}),
         },
-        lsHeaders,
+        { ...lsHeaders, ...requestHeaders },
       )
 
       if (pyStatus < 200 || pyStatus >= 300) {
@@ -211,11 +235,13 @@ export default async function chatRoutes(fastify: FastifyInstance) {
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
         'X-Accel-Buffering': 'no',
+        'X-Request-ID': requestId,
+        'X-Run-Id': runId,
         'Access-Control-Allow-Origin': '*',
       })
 
       // 先发送sessionId
-      reply.raw.write(`data: ${JSON.stringify({ type: 'session', content: sessionId })}\n\n`)
+      reply.raw.write(`data: ${JSON.stringify({ type: 'session', content: sessionId, request_id: requestId, run_id: runId })}\n\n`)
 
       await new Promise<void>((resolve, reject) => {
         incoming.on('data', (chunk: Buffer) => {
@@ -239,6 +265,8 @@ export default async function chatRoutes(fastify: FastifyInstance) {
           stream: true,
           session_id: (request.body as any)?.sessionId || null,
           user_id: (request.body as any)?.userId || null,
+          request_id: requestId,
+          run_id: runId,
         },
       },
     )

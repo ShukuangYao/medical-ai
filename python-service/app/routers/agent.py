@@ -2,11 +2,11 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from app.models import ChatRequest, ChatResponse, TraceItem, Source
-import json
 import time
 from datetime import datetime, timezone
 
 from app.core.singletons import get_agent_orchestrator
+from app.core.sse_envelope import sse_context_from_request, sse_envelope, sse_data_line
 
 from langsmith import RunTree
 from langsmith.run_helpers import get_current_run_tree, tracing_context
@@ -23,9 +23,11 @@ async def startup():
         print(f"Agent编排器初始化失败: {e}")
 
 @router.post("/agent/stream")
-async def agent_diagnose_stream(request: ChatRequest):
+async def agent_diagnose_stream(http_request: Request, request: ChatRequest):
     """多智能体协作诊断（流式输出）"""
     agent_orchestrator = await get_agent_orchestrator()
+
+    sse_ctx = sse_context_from_request(http_request)
 
     parent = get_current_run_tree()
     inputs = {
@@ -36,6 +38,8 @@ async def agent_diagnose_stream(request: ChatRequest):
         "model_name": request.model_name,
         "agent_pipeline": request.agent_pipeline or "fast",
         "stream": True,
+        "request_id": sse_ctx.request_id or None,
+        "run_id": sse_ctx.run_id or None,
     }
     start_time = datetime.now(timezone.utc)
     root = (
@@ -62,7 +66,8 @@ async def agent_diagnose_stream(request: ChatRequest):
                 ):
                     if chunk.get("type") == "result":
                         last_report = chunk.get("content")
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    evt = sse_envelope(chunk, ctx=sse_ctx, mutate=True)
+                    yield sse_data_line(evt)
             root.end(
                 outputs={"report": last_report, "elapsed_ms": int((time.perf_counter() - t0) * 1000)},
                 end_time=datetime.now(timezone.utc),
@@ -83,7 +88,8 @@ async def agent_diagnose_stream(request: ChatRequest):
                     root.patch()
             except Exception:
                 pass
-            yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+            err_evt = sse_envelope({"type": "error", "content": str(e)}, ctx=sse_ctx, mutate=False)
+            yield sse_data_line(err_evt)
         finally:
             if not ended:
                 try:
@@ -99,9 +105,11 @@ async def agent_diagnose_stream(request: ChatRequest):
 
 
 @router.post("/agent", response_model=ChatResponse)
-async def agent_diagnose(request: ChatRequest):
+async def agent_diagnose(http_request: Request, request: ChatRequest):
     """多智能体协作诊断（非流式）"""
     agent_orchestrator = await get_agent_orchestrator()
+
+    sse_ctx = sse_context_from_request(http_request)
 
     try:
         parent = get_current_run_tree()
@@ -166,7 +174,13 @@ async def agent_diagnose(request: ChatRequest):
             report=report
         )
         root.end(
-            outputs={"answer": resp.answer, "report": report, "elapsed_ms": int((time.perf_counter() - t0) * 1000)},
+            outputs={
+                "answer": resp.answer,
+                "report": report,
+                "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+                "request_id": sse_ctx.request_id or None,
+                "run_id": sse_ctx.run_id or None,
+            },
             end_time=datetime.now(timezone.utc),
         )
         root.patch()

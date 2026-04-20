@@ -119,7 +119,32 @@ flowchart TB
 
 ## SSE 事件协议
 
-> 事件统一结构：`{"type": string, "content": any}`，通过 `data: <json>\n\n` 发送。
+> **协议版本**：`sse_protocol_version = 1`（兼容旧实现：仍以 `type/content` 为核心；新增字段前端必须忽略未知字段）。
+>
+> **事件统一结构（Envelope）**：通过 `data: <json>\n\n` 发送，最小字段如下：
+>
+> - `type: string`：事件类型（例如 `token/thinking/sources/result/done/error/session`）
+> - `content: any`：事件负载
+>
+> v1 额外推荐字段（用于 Phase 0 的“关联字段贯通/取消/反馈闭环”）：
+>
+> - `request_id?: string`：一次 HTTP 请求的关联 ID（Node 生成，贯通 Node→Python→SSE→LangSmith）
+> - `run_id?: string`：一次生成/流式运行的关联 ID（Node 生成；后续 cancel/feedback 的主键）
+> - `seq?: number`：事件序号（同一条 SSE 流内单调递增，便于调试与断线续传对齐）
+
+### request_id / run_id 生成与传递（SSOT）
+
+> 目标：同一次请求可在 **Node 日志**、**Python 日志**、**LangSmith trace** 中通过同一组 ID 串起来；并且 SSE 事件都可携带该组 ID。
+
+- **生成位置**：Node（`node-backend/src/routes/chat.ts`）
+  - 若浏览器未提供，则 Node 生成 `request_id/run_id`（UUID）
+- **Node → Python 透传方式**（HTTP headers）
+  - `X-Request-ID: <request_id>`
+  - `X-Run-Id: <run_id>`
+- **Python 侧回传方式**
+  - Python SSE 事件在每个事件中附带：`request_id/run_id/seq`（由 `python-service/app/core/sse_envelope.py` 统一注入）
+- **浏览器可见性（调试）**
+  - Node 会在响应头中回传 `X-Request-ID/X-Run-Id`（便于在 DevTools 的 Response Headers 中查看）
 
 ### RAG SSE（`POST /api/rag/stream`）
 

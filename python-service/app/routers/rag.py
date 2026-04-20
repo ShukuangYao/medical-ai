@@ -1,11 +1,11 @@
 """RAG路由 - 支持SSE流式输出"""
 import asyncio
-import json
 import time
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from app.core.singletons import rag_engine, ensure_rag_initialized
+from app.core.sse_envelope import sse_context_from_request, sse_envelope, sse_data_line
 
 from langsmith import RunTree
 from langsmith.run_helpers import get_current_run_tree, tracing_context
@@ -13,7 +13,6 @@ from langsmith.run_helpers import get_current_run_tree, tracing_context
 router = APIRouter()
 
 DEFAULT_USER_ID = "anonymous"
-
 
 @router.on_event("startup")
 async def startup():
@@ -102,6 +101,8 @@ async def rag_query(request: Request):
 async def rag_query_stream(request: Request):
     """RAG问答（SSE流式输出）"""
     try:
+        sse_ctx = sse_context_from_request(request)
+
         data = await request.json()
         question = data.get("question", data.get("message", ""))
         session_id = data.get("session_id", "default")
@@ -121,6 +122,8 @@ async def rag_query_stream(request: Request):
             "model_provider": model_provider,
             "model_name": model_name,
             "stream": True,
+            "request_id": sse_ctx.request_id or None,
+            "run_id": sse_ctx.run_id or None,
         }
         start_time = datetime.now(timezone.utc)
         tags = [f"mode:rag", f"stream:true", f"session:{session_id}"]
@@ -153,7 +156,12 @@ async def rag_query_stream(request: Request):
             try:
                 with tracing_context(parent=root):
                     # 先产出一个事件，确保客户端尽快收到响应头并开始渲染（避免初始化耗时导致“无输出”假象）
-                    yield f"data: {json.dumps({'type': 'thinking', 'content': '🚀 请求已接收，正在准备检索与生成...'}, ensure_ascii=False)}\n\n"
+                    meta_evt = sse_envelope(
+                        {"type": "thinking", "content": "🚀 请求已接收，正在准备检索与生成..."},
+                        ctx=sse_ctx,
+                        mutate=False,
+                    )
+                    yield sse_data_line(meta_evt)
                     uid = data.get("user_id") or data.get("userId") or DEFAULT_USER_ID
                     async for chunk in rag_engine.query_stream(
                         question,
@@ -168,8 +176,8 @@ async def rag_query_stream(request: Request):
                             full += chunk.get("content") or ""
                         elif chunk.get("type") == "sources":
                             sources = chunk.get("content") or []
-                        event_data = json.dumps(chunk, ensure_ascii=False)
-                        yield f"data: {event_data}\n\n"
+                        evt = sse_envelope(chunk, ctx=sse_ctx, mutate=True)
+                        yield sse_data_line(evt)
                 root.end(
                     outputs={
                         "answer": full,
@@ -202,7 +210,8 @@ async def rag_query_stream(request: Request):
                     ended = True
                 # Best-effort: tell client we failed, but do not crash the ASGI app (so traces can flush cleanly).
                 try:
-                    yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+                    err_evt = sse_envelope({"type": "error", "content": str(e)}, ctx=sse_ctx, mutate=False)
+                    yield sse_data_line(err_evt)
                 except Exception:
                     pass
                 return
