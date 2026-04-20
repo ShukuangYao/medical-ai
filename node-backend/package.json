@@ -9,11 +9,12 @@
     "lint": "eslint src --ext .ts"
   },
   "dependencies": {
-    "fastify": "^4.25.0",
     "@fastify/cors": "^8.4.2",
     "@fastify/multipart": "^8.0.0",
-    "redis": "^4.6.11",
     "dotenv": "^16.3.1",
+    "fastify": "^4.25.0",
+    "langsmith": "^0.5.18",
+    "redis": "^4.6.11",
     "uuid": "^9.0.1"
   },
   "devDependencies": {

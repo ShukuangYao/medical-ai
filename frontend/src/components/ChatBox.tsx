@@ -4,7 +4,7 @@ import { SendOutlined, ThunderboltOutlined, StopOutlined } from '@ant-design/ico
 import { useChatStore } from '../store/chatStore'
 import { chatAPI } from '../services/api'
 import MessageList from './MessageList'
-import type { ChatMode, ModelName, ModelProvider } from '../types/shared'
+import type { AgentPipeline, ChatMode, ModelName, ModelProvider } from '../types/shared'
 
 const { TextArea } = Input
 const { Text } = Typography
@@ -17,6 +17,8 @@ function ChatBox({ mode }: ChatBoxProps) {
   const [inputValue, setInputValue] = useState('')
   const [streamMode, setStreamMode] = useState(true)
   const [graphMode, setGraphMode] = useState(true)
+  /** Agent: full restores legacy multi-step agents (richer but slower). */
+  const [agentDetailMode, setAgentDetailMode] = useState(false)
   const streamContentRef = useRef('')
   const tokenQueueRef = useRef<string[]>([])
   const typewriterTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -182,6 +184,8 @@ function ChatBox({ mode }: ChatBoxProps) {
     addMessageForSession(m, sid, { role: 'user', content: userMessage })
     setLoadingForMode(m, true)
 
+    const agentPipeline: AgentPipeline | undefined = m === 'agent' ? (agentDetailMode ? 'full' : 'fast') : undefined
+
     if (streamMode) {
       streamContentRef.current = ''
       tokenQueueRef.current = []
@@ -202,6 +206,7 @@ function ChatBox({ mode }: ChatBoxProps) {
           chatHistory: contextHistory,
           modelProvider,
           modelName,
+          agentPipeline,
         },
         {
           onToken: (token) => { tokenQueueRef.current.push(...token.split('')); startTypewriter() },
@@ -229,7 +234,10 @@ function ChatBox({ mode }: ChatBoxProps) {
               ...msg, thinkingSteps: [...(msg.thinkingSteps ?? []), ...steps],
             }))
           },
-          onSession: (id) => useChatStore.getState().setSessionIdForMode(requestModeRef.current, id),
+          onSession: (id) => {
+            requestSessionIdRef.current = id
+            useChatStore.getState().setSessionIdForMode(requestModeRef.current, id)
+          },
           onSources: (sources) => updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, aid, (msg) => ({ ...msg, sources })),
           onResult: (report) => {
             updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, aid, (msg) => ({
@@ -251,6 +259,8 @@ function ChatBox({ mode }: ChatBoxProps) {
         }
       )
     } else {
+      // Non-stream: still create an assistant placeholder so UI never "looks empty" if request is slow/fails.
+      const pendingId = addMessageForSession(m, sid, { role: 'assistant', content: '正在生成中，请稍候…', thinkingSteps: [], thinkingExpanded: false })
       chatAPI.sendMessage({
         message: userMessage,
         mode: m,
@@ -259,14 +269,50 @@ function ChatBox({ mode }: ChatBoxProps) {
         useGraph: graphMode,
         modelProvider,
         modelName,
+        agentPipeline,
       })
         .then((response) => {
           const store = useChatStore.getState()
           store.setSessionIdForMode(m, response.sessionId)
-          addMessageForSession(m, sid, { role: 'assistant', content: response.answer, sources: response.sources, trace: response.trace, report: response.report })
+          const text =
+            (response.answer && String(response.answer).trim()) ||
+            (response.report && typeof response.report === 'object' && (response.report as { summary?: string }).summary
+              ? String((response.report as { summary?: string }).summary).trim()
+              : '') ||
+            '（未返回摘要；若有结构化报告请展开下方卡片）'
+          updateMessageByIdForSession(m, sid, pendingId, (msg) => ({
+            ...msg,
+            content: text,
+            sources: response.sources,
+            trace: response.trace,
+            report: response.report,
+          }))
           store.checkAndSummarizeForMode(m)
         })
-        .catch(() => message.error('发送失败，请重试'))
+        .catch((err: unknown) => {
+          const ax = err as {
+            message?: string
+            code?: string
+            response?: { status?: number; data?: { detail?: string; error?: string } }
+          }
+          const detail =
+            typeof ax?.response?.data?.detail === 'string'
+              ? ax.response.data.detail
+              : typeof ax?.response?.data?.error === 'string'
+                ? ax.response.data.error
+                : ''
+          const hint =
+            detail ||
+            (ax?.response?.status != null ? `HTTP ${ax.response.status}` : '') ||
+            ax?.code ||
+            ax?.message ||
+            String(err)
+          message.error(`发送失败：${hint}`)
+          updateMessageByIdForSession(m, sid, pendingId, (msg) => ({
+            ...msg,
+            content: `请求失败（${hint}）。可试流式或稍后重试。`,
+          }))
+        })
         .finally(() => setLoadingForMode(m, false))
     }
   }
@@ -280,6 +326,12 @@ function ChatBox({ mode }: ChatBoxProps) {
         <Switch size="small" checked={streamMode} onChange={setStreamMode} disabled={loading} />
         <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>图谱检索</Text>
         <Switch size="small" checked={graphMode} onChange={setGraphMode} disabled={mode !== 'rag' || loading} />
+        {mode === 'agent' ? (
+          <>
+            <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>详细分析</Text>
+            <Switch size="small" checked={agentDetailMode} onChange={setAgentDetailMode} disabled={loading} />
+          </>
+        ) : null}
         <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>模型</Text>
         <Select
           size="small"

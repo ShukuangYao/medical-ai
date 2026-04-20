@@ -12,10 +12,13 @@ class GraphStoreNeo4jClient:
 
     def connect(self):
         """连接Neo4j"""
-        self.driver = GraphDatabase.driver(
-            settings.NEO4J_URI,
-            auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
-        )
+        kwargs = {}
+        # Some Neo4j instances can have auth disabled (dbms.security.auth_enabled=false).
+        # In that case, sending a Basic auth token fails with:
+        # "Unsupported authentication token, scheme 'basic' is not supported."
+        if settings.NEO4J_PASSWORD:
+            kwargs["auth"] = (settings.NEO4J_USER, settings.NEO4J_PASSWORD)
+        self.driver = GraphDatabase.driver(settings.NEO4J_URI, **kwargs)
         print(f"已连接Neo4j: {settings.NEO4J_URI}")
 
     def close(self):

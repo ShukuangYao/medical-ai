@@ -9,7 +9,10 @@ export default defineConfig({
     proxy: {
       '/api': {
         target: 'http://localhost:3001',
-        changeOrigin: true
+        changeOrigin: true,
+        // Agent `full` can exceed default proxy/socket limits (align with axios 600s).
+        timeout: 600000,
+        proxyTimeout: 600000,
       }
     }
   }

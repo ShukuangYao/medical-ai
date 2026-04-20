@@ -70,15 +70,18 @@ class Settings:
     RERANKER_RELATIVE_THRESHOLD = 0.5  # 相对分数阈值（与最高分差50%）
 
     # RAG检索配置
-    VECTOR_TOP_K = 20  # 向量检索返回数量
-    ES_TOP_K = 20  # ES检索返回数量
+    VECTOR_TOP_K = 6  # 向量检索返回数量（降低默认值以减少 rerank 开销与端到端延迟）
+    ES_TOP_K = 6  # ES检索返回数量（降低默认值以减少 rerank 开销与端到端延迟）
     RERANK_TOP_K = 5  # 重排序后保留数量
     MMR_LAMBDA = 0.7  # MMR多样性参数（0.7相关 + 0.3多样）
-    MMR_FETCH_K = 40  # MMR初始候选集大小
+    MMR_FETCH_K = 10  # MMR初始候选集大小（降低默认值以减少 rerank 开销与端到端延迟）
+
+    # Agent `full` 管线：单步 LLM 墙钟上限（超时返回空 JSON，下游走 fallback，避免整请求卡死）
+    AGENT_FULL_LLM_STEP_TIMEOUT_S = float(os.getenv("AGENT_FULL_LLM_STEP_TIMEOUT_S", "150"))
 
     # Token管理
     MAX_CONTEXT_TOKENS = 3000  # 上下文最大Token数
-    MAX_OUTPUT_TOKENS = 1024  # 生成最大Token数
+    MAX_OUTPUT_TOKENS = 500  # 生成最大Token数（可按延迟/费用调小或调大）
     MAX_HISTORY_TOKENS = int(os.getenv("MAX_HISTORY_TOKENS", "800"))  # 历史对话窗口最大Token数（估算）
 
     # 文档切片配置

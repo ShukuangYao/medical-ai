@@ -1,3 +1,13 @@
+import dotenv from 'dotenv'
+dotenv.config()
+
+// Hard default: keep all traces in a single LangSmith project.
+// Avoid accidental drift to "medicine-ai" from a stale shell env.
+if (!process.env.LANGSMITH_PROJECT || process.env.LANGSMITH_PROJECT === 'medicine-ai') {
+  process.env.LANGSMITH_PROJECT = 'medical-ai'
+}
+if (!process.env.LANGSMITH_TRACING_V2) process.env.LANGSMITH_TRACING_V2 = 'true'
+
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import multipart from '@fastify/multipart'
@@ -27,6 +37,10 @@ await fastify.register(healthRoutes)
 // 启动服务器
 const start = async () => {
   try {
+    fastify.log.info(
+      { LANGSMITH_PROJECT: process.env.LANGSMITH_PROJECT, LANGSMITH_TRACING_V2: process.env.LANGSMITH_TRACING_V2 },
+      'LangSmith env',
+    )
     await fastify.listen({ port: config.port, host: '0.0.0.0' })
     console.log(`Server listening on port ${config.port}`)
   } catch (err) {

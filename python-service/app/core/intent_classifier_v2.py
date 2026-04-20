@@ -85,6 +85,21 @@ class HybridIntentClassifier:
         self.rule_hit_count = 0
         self.llm_call_count = 0
 
+    @staticmethod
+    def _looks_like_department(text: Optional[str]) -> bool:
+        """Heuristic: treat strings like '神经内科/外科/皮肤科/门诊' as department names."""
+        if not text:
+            return False
+        s = str(text).strip()
+        if not s:
+            return False
+        if s.endswith("门诊"):
+            return True
+        # Most departments contain '科' (内科/外科/耳鼻喉科/神经内科等)
+        if "科" in s:
+            return True
+        return False
+
     async def classify(self, question: str) -> Dict:
         """
         混合意图识别
@@ -103,6 +118,11 @@ class HybridIntentClassifier:
         # 第一层：规则匹配
         rule_result = self._rule_classify(question)
         if rule_result:
+            # If rule extracted a department-like entity for "disease_department",
+            # avoid graph lookup because graph expects a disease entity.
+            if rule_result.get("intent") == "disease_department" and self._looks_like_department(rule_result.get("entity")):
+                rule_result["use_graph"] = False
+                rule_result["entity"] = None
             self.rule_hit_count += 1
             return rule_result
 
@@ -192,6 +212,12 @@ class HybridIntentClassifier:
                 "disease_department", "disease_food", "symptom_disease"
             ]
             use_graph = intent in graph_intents
+
+            # Post-process: for "挂什么科/看什么科" questions, the entity should be a disease/symptom.
+            # If the model returns a department name (e.g. "神经内科"), disable graph lookup and clear entity.
+            if intent == "disease_department" and self._looks_like_department(entity):
+                use_graph = False
+                entity = None
 
             return {
                 "use_graph": use_graph,

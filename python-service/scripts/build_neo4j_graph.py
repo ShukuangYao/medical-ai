@@ -218,10 +218,10 @@ def _merge_relationship_batch(
 
 
 def import_to_neo4j(payload: GraphPayload, clear: bool = False):
-    driver = GraphDatabase.driver(
-        settings.NEO4J_URI,
-        auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
-    )
+    kwargs = {}
+    if settings.NEO4J_PASSWORD:
+        kwargs["auth"] = (settings.NEO4J_USER, settings.NEO4J_PASSWORD)
+    driver = GraphDatabase.driver(settings.NEO4J_URI, **kwargs)
     # Neo4j 5 多数据库：显式选择目标业务库（例如 medical-db）
     with driver.session(database=settings.NEO4J_DATABASE) as session:
         if clear:

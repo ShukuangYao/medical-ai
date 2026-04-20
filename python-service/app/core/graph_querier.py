@@ -106,6 +106,10 @@ class GraphQuerier:
 
     def _query_disease_department(self, disease: str) -> List[Dict]:
         """查询疾病科室"""
+        # If the extracted "disease" already looks like a department name (e.g. "神经内科"),
+        # skip graph lookup to avoid confusing department-as-disease queries.
+        if isinstance(disease, str) and ("科" in disease or disease.endswith("门诊")):
+            return []
         dept = self.graph_store.query_disease_department(disease)
         if not dept:
             return []

@@ -4,8 +4,8 @@ import { createSSEConnection } from './sseClient'
 
 const api = axios.create({
   baseURL: '/api',
-  // Non-stream requests can be slow (model + retrieval). Streaming uses fetch/SSE, not this timeout.
-  timeout: 120000,
+  // Non-stream: agent `full` runs many LLM steps; 10m default (streaming uses fetch/SSE separately).
+  timeout: 600000,
 })
 
 export interface StreamCallbacks {
@@ -31,6 +31,7 @@ export const chatAPI = {
     formData.append('useGraph', String(request.useGraph ?? true))
     if (request.modelProvider) formData.append('modelProvider', request.modelProvider)
     if (request.modelName) formData.append('modelName', request.modelName)
+    if (request.agentPipeline) formData.append('agentPipeline', request.agentPipeline)
     if (request.file) formData.append('file', request.file)
 
     const response = await api.post<ChatResponse>('/chat', formData, {
@@ -55,6 +56,7 @@ export const chatAPI = {
         chat_history: request.chatHistory ?? [],
         modelProvider: request.modelProvider,
         modelName: request.modelName,
+        agentPipeline: request.agentPipeline,
       },
       callbacks: {
         onToken: callbacks.onToken,

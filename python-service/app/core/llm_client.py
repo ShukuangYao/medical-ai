@@ -1,10 +1,18 @@
 """LLM客户端 - OpenAI兼容接口（Qwen/DashScope, DeepSeek 等）"""
 from __future__ import annotations
 
+import time
 from typing import AsyncGenerator, List, Dict, Optional, Literal
+from datetime import datetime, timezone
 from openai import AsyncOpenAI
 from app.config import settings
 from app.core.context_builder import ContextBuilder
+from app.core.ls_timing import now_utc, perf_ms_since, span_times
+
+from langsmith.run_helpers import get_current_run_tree
+
+_LANGSMITH_BUILD_ID = "ls-timing-fix-2026-04-14"
+_LANGSMITH_SPAN_SUFFIX = f"@{_LANGSMITH_BUILD_ID}"
 
 
 class OpenAILLM:
@@ -48,13 +56,54 @@ class OpenAILLM:
         model: Optional[str] = None,
     ) -> str:
         """非流式生成回答"""
-        response = await self.client.chat.completions.create(
-            model=model or self.model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens or settings.MAX_OUTPUT_TOKENS,
-        )
-        return response.choices[0].message.content or ""
+        m = model or self.model
+        max_out = max_tokens or settings.MAX_OUTPUT_TOKENS
+        parent = get_current_run_tree()
+        span = None
+        if parent is not None:
+            span = parent.create_child(
+                name=f"openai_chat_completions{_LANGSMITH_SPAN_SUFFIX}",
+                run_type="llm",
+                inputs={
+                    "model": m,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_out,
+                },
+            )
+            span.post()
+            t0_span = time.perf_counter()
+
+        t0 = time.perf_counter()
+        try:
+            response = await self.client.chat.completions.create(
+                model=m,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_out,
+            )
+            text = response.choices[0].message.content or ""
+            if span is not None:
+                span.end(
+                    outputs={
+                        "text": text,
+                        "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+                        "duration_ms": perf_ms_since(t0_span),
+                        "build_id": _LANGSMITH_BUILD_ID,
+                    }
+                    ,
+                    metadata={"duration_ms": perf_ms_since(t0_span), "build_id": _LANGSMITH_BUILD_ID},
+                )
+                span.patch()
+            return text
+        except Exception as e:
+            if span is not None:
+                span.end(
+                    error=str(e),
+                    metadata={"duration_ms": perf_ms_since(t0_span), "build_id": _LANGSMITH_BUILD_ID},
+                )
+                span.patch()
+            raise
 
     async def generate_stream(
         self,
@@ -62,18 +111,89 @@ class OpenAILLM:
         temperature: float = 0.7,
         max_tokens: int = None,
         model: Optional[str] = None,
+        include_reasoning: bool = False,
     ) -> AsyncGenerator[str, None]:
         """流式生成回答，逐token返回"""
-        response = await self.client.chat.completions.create(
-            model=model or self.model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens or settings.MAX_OUTPUT_TOKENS,
-            stream=True,
-        )
-        async for chunk in response:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+        m = model or self.model
+        max_out = max_tokens or settings.MAX_OUTPUT_TOKENS
+        parent = get_current_run_tree()
+        span = None
+        if parent is not None:
+            span = parent.create_child(
+                name=f"openai_chat_completions_stream{_LANGSMITH_SPAN_SUFFIX}",
+                run_type="llm",
+                inputs={
+                    "model": m,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_out,
+                    "stream": True,
+                },
+            )
+            span.post()
+            t0_span = time.perf_counter()
+
+        t0 = time.perf_counter()
+        out = ""
+        first_token_at: Optional[float] = None
+        try:
+            response = await self.client.chat.completions.create(
+                model=m,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_out,
+                stream=True,
+            )
+            async for chunk in response:
+                if not chunk.choices:
+                    continue
+                delta = getattr(chunk.choices[0], "delta", None)
+                if not delta:
+                    continue
+
+                # OpenAI-compatible providers may stream:
+                # - delta.content (final answer text)
+                # - delta.reasoning_content (internal reasoning; should NOT be mixed into user-visible answer by default)
+                token_parts: List[str] = []
+                v = getattr(delta, "content", None)
+                if isinstance(v, str) and v:
+                    token_parts.append(v)
+                if include_reasoning:
+                    rv = getattr(delta, "reasoning_content", None)
+                    if isinstance(rv, str) and rv:
+                        token_parts.append(rv)
+                if not token_parts:
+                    continue
+
+                if first_token_at is None:
+                    first_token_at = time.perf_counter()
+                token = "".join(token_parts)
+                out += token
+                yield token
+            if span is not None:
+                span.end(
+                    outputs={
+                        "text": out,
+                        "output_chars": len(out),
+                        "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+                        "time_to_first_token_ms": (
+                            int((first_token_at - t0) * 1000) if first_token_at is not None else None
+                        ),
+                        "duration_ms": perf_ms_since(t0_span),
+                        "build_id": _LANGSMITH_BUILD_ID,
+                    }
+                    ,
+                    metadata={"duration_ms": perf_ms_since(t0_span), "build_id": _LANGSMITH_BUILD_ID},
+                )
+                span.patch()
+        except Exception as e:
+            if span is not None:
+                span.end(
+                    error=str(e),
+                    metadata={"duration_ms": perf_ms_since(t0_span), "build_id": _LANGSMITH_BUILD_ID},
+                )
+                span.patch()
+            raise
 
     def build_rag_messages(
         self,
@@ -94,6 +214,7 @@ class OpenAILLM:
 7. 如果用户问题涉及“这两个/这些”但无法从对话历史确定对应哪些实体，请先反问澄清，不要自行猜测补全
 8. 禁止“捏造用户画像”：不得凭空补全年龄/性别/职业/既往史/检查结果/治疗方案等个人信息。参考资料可能包含其它病例或人物信息，即使资料里出现“患者xx岁/男/透析/高血压”等，也不能当作用户信息；只能把它当作通用医学知识总结。
 9. 当用户信息不足以给出具体用药/处置建议时，先给出安全的通用建议，并列出需要补充的关键问题（例如：年龄、是否妊娠、基础病、当前用药、过敏史、是否伴随红旗征等）。
+10. 对于“挂什么科/看什么科/就诊科室/去哪个科”等问题：只回答**科室选择与就医路径**（例如首选科室、何时急诊、需要准备的信息/检查），不要展开病因鉴别或罗列具体诊断名称；更不能把参考资料里的其他病例诊断当作用户情况。
 """
         builder = ContextBuilder()
         messages, _stats = builder.build_rag_messages(

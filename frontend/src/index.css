@@ -15,3 +15,38 @@ body {
 #root {
   min-height: 100vh;
 }
+
+/* Markdown list rendering in chat messages */
+.md-list {
+  margin: 0 0 6px 18px;
+  padding: 0;
+  line-height: 1.35; /* tighter than 1.7 */
+  list-style-position: outside;
+}
+
+.md-li {
+  margin: 1px 0;
+}
+
+.md-unordered {
+  list-style-type: disc;
+}
+
+/* Render ordered lists as ul + CSS counter numbering */
+.md-ordered {
+  list-style: none;
+  counter-reset: mditem;
+}
+
+.md-ordered > li {
+  counter-increment: mditem;
+  position: relative;
+  padding-left: 1.4em; /* room for "10." */
+}
+
+.md-ordered > li::before {
+  content: counter(mditem) ". ";
+  position: absolute;
+  left: 0;
+  color: rgba(0, 0, 0, 0.65);
+}

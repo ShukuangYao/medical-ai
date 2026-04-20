@@ -212,10 +212,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const prev = s.messagesBySession[mode][sessionId] ?? []
       const nextMsgs = [...prev, full]
       const nextBySession = { ...s.messagesBySession[mode], [sessionId]: nextMsgs }
-      const isActive = s.activeSessionIdByMode[mode] === sessionId
+      // 与「当前正在聊的会话」同步：ChatBox 用 perMode.sessionId 发消息；仅 activeSessionId 会与 setSessionIdForMode 脱节
+      const isVisible = s.perMode[mode].sessionId === sessionId
       return {
         messagesBySession: { ...s.messagesBySession, [mode]: nextBySession },
-        perMode: isActive ? { ...s.perMode, [mode]: { ...s.perMode[mode], messages: nextMsgs } } : s.perMode,
+        perMode: isVisible ? { ...s.perMode, [mode]: { ...s.perMode[mode], messages: nextMsgs } } : s.perMode,
       }
     })
     return id
@@ -230,10 +231,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const nextMsgs = [...prev]
       nextMsgs[idx] = updater(nextMsgs[idx])
       const nextBySession = { ...s.messagesBySession[mode], [sessionId]: nextMsgs }
-      const isActive = s.activeSessionIdByMode[mode] === sessionId
+      const isVisible = s.perMode[mode].sessionId === sessionId
       return {
         messagesBySession: { ...s.messagesBySession, [mode]: nextBySession },
-        perMode: isActive ? { ...s.perMode, [mode]: { ...s.perMode[mode], messages: nextMsgs } } : s.perMode,
+        perMode: isVisible ? { ...s.perMode, [mode]: { ...s.perMode[mode], messages: nextMsgs } } : s.perMode,
       }
     })
   },
@@ -243,7 +244,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setSessionId: (id) => get().setSessionIdForMode(get().mode, id),
 
   setSessionIdForMode: (mode, id) => {
-    set((s) => ({ perMode: { ...s.perMode, [mode]: { ...s.perMode[mode], sessionId: id } } }))
+    set((s) => ({
+      activeSessionIdByMode: id
+        ? { ...s.activeSessionIdByMode, [mode]: id }
+        : { ...s.activeSessionIdByMode, [mode]: null },
+      perMode: { ...s.perMode, [mode]: { ...s.perMode[mode], sessionId: id } },
+    }))
+    if (id) localStorage.setItem(`medicalai.activeSessionId.${mode}`, id)
   },
 
   addMessage: (message, forMode) => {

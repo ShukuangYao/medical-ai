@@ -1,8 +1,9 @@
 import { Card, Typography, Collapse, Tag, Space, Descriptions, Divider } from 'antd'
 import { UserOutlined, RobotOutlined } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
-import { useEffect, useRef } from 'react'
+import { useLayoutEffect, useMemo, useRef } from 'react'
 import type { Message, ChatMode } from '../types/shared'
+import { sanitizeDisplayText } from '../utils/markdownSanitize'
 
 const { Text, Paragraph } = Typography
 const { Panel } = Collapse
@@ -23,22 +24,56 @@ interface MessageListProps {
 function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
   const pageText = (page?: number) => (typeof page === 'number' && page >= 1 ? `第${page}页` : null)
   const bottomRef = useRef<HTMLDivElement | null>(null)
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const shouldStickRef = useRef(true)
   const triageColor = (level?: string) => {
     if (level === 'emergency') return 'red'
     if (level === 'urgent') return 'orange'
     return 'green'
   }
 
-  // 切换 tab 或消息变化时自动滚动到底部
-  useEffect(() => {
-    // 等待 DOM 更新后再滚动更稳定
+  // 切换 tab 或消息变化时自动滚动到底部（若用户手动上滑阅读，则不强制抢滚动条）
+  // 注意：流式输出通常只是更新最后一条消息 content，不会让 messages.length 增长，
+  // 因此需要把最后一条消息的变化也纳入依赖。
+  const lastMsg = messages[messages.length - 1]
+  const lastMsgKey = useMemo(
+    () =>
+      `${lastMsg?.id ?? ''}:${(lastMsg?.content ?? '').length}:${(lastMsg?.thinkingSteps?.length ?? 0)}:${lastMsg?.report ? 1 : 0}`,
+    [lastMsg?.id, lastMsg?.content, lastMsg?.thinkingSteps, lastMsg?.report]
+  )
+
+  const scrollToBottom = () => {
+    const el = containerRef.current
+    if (!el) return
+    // Set scrollTop directly is more reliable than scrollIntoView for streaming updates.
+    el.scrollTop = el.scrollHeight
+  }
+
+  const recomputeStickiness = () => {
+    const el = containerRef.current
+    if (!el) return
+    const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    shouldStickRef.current = distanceToBottom < 120
+  }
+
+  useLayoutEffect(() => {
+    if (!shouldStickRef.current) return
+    // Ensure layout finished before reading scrollHeight.
     requestAnimationFrame(() => {
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+      requestAnimationFrame(() => {
+        scrollToBottom()
+      })
     })
-  }, [mode, messages.length])
+  }, [mode, messages.length, lastMsgKey])
 
   return (
-    <div style={{ flex: 1, overflowY: 'auto', paddingRight: 8 }}>
+    <div
+      ref={containerRef}
+      style={{ flex: 1, overflowY: 'auto', paddingRight: 8 }}
+      onScroll={() => recomputeStickiness()}
+      onWheel={() => recomputeStickiness()}
+      onTouchMove={() => recomputeStickiness()}
+    >
       <Space direction="vertical" style={{ width: '100%' }} size="small">
         {messages.map((msg, index) => (
           <Card
@@ -68,7 +103,7 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
                     <Space direction="vertical" style={{ width: '100%' }} size="small">
                       {msg.thinkingSteps.map((step, idx) => (
                         <Text key={idx} type="secondary">
-                          {step}
+                          {sanitizeDisplayText(step)}
                         </Text>
                       ))}
                     </Space>
@@ -80,12 +115,20 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
                 <ReactMarkdown
                   components={{
                     p: ({ children }) => <p style={{ margin: '0 0 6px 0' }}>{children}</p>,
-                    ul: ({ children }) => <ul style={{ margin: '0 0 6px 18px', padding: 0 }}>{children}</ul>,
-                    ol: ({ children }) => <ol style={{ margin: '0 0 6px 18px', padding: 0 }}>{children}</ol>,
-                    li: ({ children }) => <li style={{ margin: '2px 0' }}>{children}</li>,
+                    ul: ({ children }) => (
+                      <ul className="md-list md-unordered">
+                        {children}
+                      </ul>
+                    ),
+                    ol: ({ children }) => (
+                      <ul className="md-list md-ordered">
+                        {children}
+                      </ul>
+                    ),
+                    li: ({ children }) => <li className="md-li">{children}</li>,
                   }}
                 >
-                  {msg.content}
+                  {sanitizeDisplayText(msg.content)}
                 </ReactMarkdown>
               </Paragraph>
 
@@ -98,11 +141,12 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
                         <Tag color={triageColor(msg.report.triage?.severity_level)}>
                           {msg.report.triage?.severity_level ?? 'routine'}
                         </Tag>
-                        <Text type="secondary">{msg.report.triage?.why}</Text>
+                        <Text type="secondary">{sanitizeDisplayText(msg.report.triage?.why ?? '')}</Text>
                       </Space>
                       {msg.report.triage?.red_flags?.length ? (
                         <Paragraph style={{ marginTop: 8, marginBottom: 0 }}>
-                          <Text strong>红旗征：</Text> {msg.report.triage.red_flags.join('；')}
+                          <Text strong>红旗征：</Text>{' '}
+                          {msg.report.triage.red_flags.map((x) => sanitizeDisplayText(x)).join('；')}
                         </Paragraph>
                       ) : null}
                     </Card>
@@ -116,7 +160,7 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
                           {(msg.report.department?.alternatives ?? []).join('、') || '—'}
                         </Descriptions.Item>
                         <Descriptions.Item label="理由">
-                          {msg.report.department?.reason || '—'}
+                          {sanitizeDisplayText(msg.report.department?.reason || '—')}
                         </Descriptions.Item>
                       </Descriptions>
                     </Card>
@@ -124,13 +168,13 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
                     <Card size="small" type="inner" title="下一步举措">
                       <Descriptions size="small" column={1}>
                         <Descriptions.Item label="立即措施">
-                          {(msg.report.next_steps?.immediate_actions ?? []).join('；') || '—'}
+                          {(msg.report.next_steps?.immediate_actions ?? []).map((x) => sanitizeDisplayText(x)).join('；') || '—'}
                         </Descriptions.Item>
                         <Descriptions.Item label="建议检查">
-                          {(msg.report.next_steps?.recommended_tests ?? []).join('；') || '—'}
+                          {(msg.report.next_steps?.recommended_tests ?? []).map((x) => sanitizeDisplayText(x)).join('；') || '—'}
                         </Descriptions.Item>
                         <Descriptions.Item label="就医时机">
-                          {(msg.report.next_steps?.when_to_seek_care ?? []).join('；') || '—'}
+                          {(msg.report.next_steps?.when_to_seek_care ?? []).map((x) => sanitizeDisplayText(x)).join('；') || '—'}
                         </Descriptions.Item>
                       </Descriptions>
                     </Card>
@@ -164,7 +208,7 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
                             ellipsis={{ rows: 3, expandable: true }}
                             style={{ marginTop: 6, marginBottom: 0 }}
                           >
-                            {source.content}
+                            {sanitizeDisplayText(source.content)}
                           </Paragraph>
                         </Card>
                       ))}

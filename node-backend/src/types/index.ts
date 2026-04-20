@@ -23,10 +23,16 @@ export interface ChatResponse {
   answer: string
   sources?: Source[]
   trace?: TraceItem[]
+  /**
+   * Agent mode may return a structured report for rich UI rendering.
+   * RAG mode usually leaves this empty.
+   */
+  report?: unknown
 }
 
 export interface PythonServiceResponse {
   answer: string
   sources?: Source[]
   trace?: TraceItem[]
+  report?: unknown
 }

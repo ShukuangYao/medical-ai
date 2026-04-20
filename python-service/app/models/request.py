@@ -11,3 +11,5 @@ class ChatRequest(BaseModel):
     chat_history: Optional[List[Dict[str, Any]]] = None
     model_provider: Optional[Literal["qwen", "deepseek"]] = None
     model_name: Optional[str] = None
+    # Agent-only: "fast" merges LLM steps for latency; "full" runs the legacy multi-step agents.
+    agent_pipeline: Optional[Literal["fast", "full"]] = "fast"

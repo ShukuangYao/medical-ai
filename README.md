@@ -32,7 +32,11 @@
 
 ```bash
 cd medical-ai
-cp .env.example .env
+# 云服务器 / 纯 compose 部署（容器互联用 service 名）：
+cp .env.docker.example .env
+#
+# 本机分别启动（连本机 Desktop/本机依赖）：
+# cp .env.example .env
 ```
 
 1. 编辑 `.env`，至少填好：
@@ -40,11 +44,23 @@ cp .env.example .env
 - `DASHSCOPE_API_KEY`（默认 LLM 配置使用 DashScope 的 OpenAI 兼容接口）
 - `NEO4J_PASSWORD`（供 compose 内的 neo4j 使用）
 
+（可选）启用 LangSmith Tracing（全链路可观测性）：在 `.env` 中加入
+
+- `LANGSMITH_TRACING_V2=true`
+- `LANGSMITH_API_KEY=...`
+- `LANGSMITH_PROJECT=medical-ai`
+
 1. 启动依赖与服务：
 
 ```bash
 docker compose up -d
 ```
+
+#### 云服务器部署注意事项
+
+- **容器内不要用 `127.0.0.1` 连接依赖**：应使用 compose service 名（如 `neo4j`/`redis`/`elasticsearch`/`milvus-standalone`）。
+- **尽量不要把数据库端口暴露到公网**：一般只需要暴露前端/网关端口；数据库端口仅在内网/容器网络可达即可。
+- **数据持久化**：ES/Milvus/etcd/minio/redis 等在 compose 中已使用 volume；**Neo4j 在 compose 中使用命名卷 `neo4j-data`**（避免 macOS 下宿主机 bind mount 带来的文件锁问题）。云上可将 Docker volume 数据目录放到挂载的云盘；若你曾使用旧的 `./data/neo4j` 绑定挂载，需要自行迁移数据到 volume（compose 不会自动迁移）。
 
 1. 打开前端：
 
@@ -58,9 +74,13 @@ docker compose up -d
 
 ```bash
 cd medical-ai/python-service
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+conda env create -f conda-env.yml
+conda activate medical-ai-py311
+
+# 如遇 pip SSL EOF，可临时切换镜像
+export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+export PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+pip install -r requirements.txt -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -104,6 +124,17 @@ pnpm dev
 - **输出**：结构化病历分析报告（`report`，严格 JSON）+ 简短总结（`answer`/`report.summary`）+（可选）推理过程（`trace`）
 - **流式输出**：支持 SSE 流式（`thinking / intent / agent_step / sources / result / done`），前端会实时更新“思考过程”，并在 `result` 到达后渲染结构化卡片。
 
+#### 快速模式 vs 详细模式（多 Agent 仍在）
+
+为兼顾 **耗时** 与 **分析粒度**，病历分析支持两种流水线（默认 **快速**）：
+
+| 模式 | UI | API（经 Node 网关） | Python 字段 | 说明 |
+|------|----|---------------------|---------------|------|
+| **快速**（默认） | 「详细分析」关闭 | `agentPipeline: "fast"` 或不传 | `agent_pipeline: "fast"` | 合并部分 LLM 步骤，响应更快；`agent_step` 仍会推送以便展示过程 |
+| **详细**（原多步） | 「详细分析」打开 | `agentPipeline: "full"` | `agent_pipeline: "full"` | 恢复分角色多轮 LLM + Coordinator 汇总，**更细但更慢** |
+
+说明：**多 Agent 代码与角色仍在**；`fast` 是编排上的“少轮次合并”，不是删除 Agent。
+
 #### 病历分析输出 JSON（`report: AgentReport`）
 
 `report` 的核心字段如下（前端按模块卡片渲染）：
@@ -132,7 +163,7 @@ flowchart TB
 
   rag --> es[Elasticsearch_9200]
   rag --> milvus[Milvus_19530]
-  rag --> neo4j[Neo4j_7687]
+  rag --> neo4j[Neo4j]
   python --> redis[Redis_6379]
 ```
 
@@ -172,7 +203,7 @@ sequenceDiagram
 
 对应代码：
 
-- Node：`node-backend/src/routes/chat.ts` 中 `mode === 'agent'` → Python `POST /api/agent`
+- Node：`node-backend/src/routes/chat.ts` 中 `mode === 'agent'` → Python `POST /api/agent/stream`（流式）或 `POST /api/agent`（非流式）；可选携带 `agentPipeline` → `agent_pipeline`
 - Python：`python-service/app/routers/agent.py` 汇总 `diagnose_stream`，通过 SSE 持续输出事件流（`thinking / intent / agent_step / sources / result / done`）
 
 ```mermaid
@@ -186,7 +217,7 @@ sequenceDiagram
   B->>F: 输入病历文本
   F->>N: POST /api/chat/stream {mode:agent,message,...}
   N->>P: POST /api/agent/stream
-  P->>A: diagnose_stream(message,session_id)
+  P->>A: diagnose_stream(message,session_id,agent_pipeline)
   A-->>P: SSE data: {type:thinking/intent/agent_step/sources/result/done}
   P-->>N: SSE转发
   N-->>F: SSE转发
@@ -284,6 +315,8 @@ RAG 可能会降级走 **Elasticsearch** 或其它检索来源；是否可用取
 - **Agent 流式链路对齐**：Node 的 `POST /api/chat/stream` 在 `mode=agent` 时已转发到 Python `POST /api/agent/stream`（SSE）。
 - **病历分析严格 JSON**：Python 输出 `report: AgentReport`（含意图、病历校验纠错、结构化抽取、紧急程度、科室、下一步举措、安全审阅等模块）。
 - **前端卡片展示**：病历分析结果会以卡片展示（紧急程度/科室/下一步举措），并保留过程日志与 sources。
+- **病历分析快速/详细**：支持 `agent_pipeline`（`fast` | `full`）；前端病历分析 Tab 提供「详细分析」开关；非流式请求前端超时已放宽，避免长分析被误判失败。
+- **Neo4j（Compose）**：数据使用命名卷 `neo4j-data`；宿主机访问 HTTP `7475`、Bolt `7688`（避免与本机 Neo4j Desktop 默认端口冲突）。
 
 ## 会话（Sessions）
 

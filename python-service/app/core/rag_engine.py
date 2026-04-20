@@ -8,8 +8,11 @@
 5. 回答生成（Qwen Turbo流式）
 6. 结果处理
 """
+import os
+import time
 import tiktoken
 from typing import Dict, List, Optional, AsyncGenerator
+from datetime import datetime, timezone
 from app.config import settings
 from app.core.embeddings import BGEEmbeddings
 from app.core.vector_store import VectorStoreMilvusClient
@@ -27,6 +30,10 @@ from app.core.context_resolver import ContextResolver
 from app.core.session_store import SessionStore
 from app.core.context_builder import ContextBuilder
 from app.core.telemetry import Telemetry
+from app.core.ls_timing import now_utc, perf_ms_since, span_times
+
+from langsmith import RunTree
+from langsmith.run_helpers import get_current_run_tree, tracing_context
 
 
 class LocalDocQA:
@@ -236,235 +243,417 @@ class LocalDocQA:
         """
         tel = Telemetry()
         tel.start("rag_total")
+
+        parent = get_current_run_tree()
+        run_t0 = time.perf_counter()
+        if parent is not None:
+            run = parent.create_child(
+                name="python_rag",
+                run_type="chain",
+                inputs={
+                    "question": question,
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "use_graph": use_graph,
+                    "model_provider": model_provider,
+                    "model_name": model_name,
+                    "stream": True,
+                },
+            )
+        else:
+            run = RunTree(
+                name="python_rag",
+                run_type="chain",
+                inputs={
+                    "question": question,
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "use_graph": use_graph,
+                    "model_provider": model_provider,
+                    "model_name": model_name,
+                    "stream": True,
+                },
+                project_name=os.getenv("LANGSMITH_PROJECT"),
+            )
+        run.post()
+
         thinking_steps: List[str] = []
 
         def _thinking(content: str) -> Dict:
             thinking_steps.append(content)
             return {"type": "thinking", "content": content}
 
-        if not self.initialized:
-            if emit_thinking:
-                # 先吐出一个事件，避免初始化耗时导致客户端长时间“无输出”
-                yield _thinking("⏳ 正在初始化检索与模型组件，请稍候...")
-            await self.initialize()
-            if emit_thinking:
-                yield _thinking("✅ 初始化完成，开始处理请求...")
-
-        # 记忆/会话持久化：仅在流式链路（或显式需要）时启用，避免非流式副作用
-        if persist:
-            if self.memory_manager:
-                # 如果没有提供chat_history，从记忆中获取最近2轮对话（避免上下文混淆）
-                if not chat_history and user_id:
-                    try:
-                        history = self.memory_manager.short_term.get_history(session_id, limit=2)
-                        chat_history = [{"role": h["role"], "content": h["content"]} for h in history[-4:]]
-                    except Exception as e:
-                        print(f"获取短期记忆失败: {e}")
-                        chat_history = []
-
-                # 再写入当前用户消息，避免把“本次提问”混进历史窗口
-                try:
-                    self.memory_manager.short_term.add_message(session_id, "user", question)
-                except Exception as e:
-                    print(f"保存短期记忆失败（Redis可能未启动）: {e}")
-
-            # 会话存储：优先从 SQLite 恢复历史（作为事实源）；仅在请求未显式传入 chat_history 时启用
-            if (not chat_history) and user_id and self.session_store:
-                try:
-                    rows = self.session_store.list_messages(
-                        session_id=session_id,
-                        user_id=user_id,
-                        mode="rag",
-                        limit=50,
-                    )
-                    chat_history = [{"role": m.role, "content": m.content} for m in rows]
-                except Exception as e:
-                    print(f"从会话存储恢复历史失败: {e}")
-
-            # 会话存储：写入用户消息
-            if user_id and self.session_store:
-                try:
-                    import uuid
-
-                    self.session_store.add_message(
-                        message_id=str(uuid.uuid4()),
-                        session_id=session_id,
-                        user_id=user_id,
-                        mode="rag",
-                        role="user",
-                        content=question,
-                    )
-                except Exception as e:
-                    print(f"写入会话消息失败: {e}")
-
-        # 步骤0：上下文消解（处理指代/追问省略）
-        original_question = question
-        resolved_question = question
-        if chat_history and len(chat_history) >= 2 and self.context_resolver:
-            if emit_thinking:
-                yield _thinking("🔗 正在消解上下文指代...")
-            resolved_question, _extracted_entity = await self.context_resolver.resolve_query(question, chat_history)
-            if resolved_question != question:
-                if emit_thinking:
-                    yield _thinking(f"✓ 消解后: {resolved_question}")
-                question = resolved_question
-
-        # 步骤1：意图识别
-        if emit_thinking:
-            yield _thinking("🤔 正在分析问题意图...")
-        tel.start("intent_classify")
-        intent_result = await self.intent_classifier.classify(question)
-        intent_evt = tel.end("intent_classify", intent=intent_result.get("intent"), confidence=float(intent_result.get("confidence", 0.0)))
-        if emit_thinking and intent_evt:
-            yield _thinking(f"⏱️ intent_classify: {intent_evt['duration_ms']}ms")
-        if not use_graph:
-            intent_result["use_graph"] = False
-
-        intent_desc = {
-            "greeting": "问候",
-            "thanks": "感谢",
-            "disease_drug": "疾病用药查询",
-            "disease_symptom": "疾病症状查询",
-            "drug_contraindication": "药品禁忌查询",
-            "disease_department": "疾病科室查询",
-            "disease_food": "疾病饮食查询",
-            "symptom_disease": "症状反查疾病",
-            "general_medical": "一般医疗问答",
-            "out_of_scope": "非医疗问题",
-        }.get(intent_result["intent"], "未知")
-
-        if emit_thinking:
-            yield {
-                "type": "thinking",
-                "content": f"✓ 识别意图: {intent_desc} (置信度: {intent_result['confidence']:.0%})",
-            }
-            thinking_steps.append(f"✓ 识别意图: {intent_desc} (置信度: {intent_result['confidence']:.0%})")
-
-        # 步骤1.5：问题改写（仅对需要检索的意图）
-        if intent_result["intent"] not in ["greeting", "thanks", "out_of_scope"]:
-            if emit_thinking:
-                yield _thinking("🔄 正在优化问题表述...")
-            tel.start("rewrite")
-            rewritten_question = await self.rewrite_chain.rewrite(question, chat_history)
-            rw_evt = tel.end("rewrite")
-            if emit_thinking and rw_evt:
-                yield _thinking(f"⏱️ rewrite: {rw_evt['duration_ms']}ms")
-            if rewritten_question != question and emit_thinking:
-                yield _thinking(f"✓ 问题改写: {rewritten_question}")
-        else:
-            rewritten_question = question
-
-        # 回传用于调试的关键中间文本
-        intent_result["raw_question"] = original_question
-        intent_result["resolved_question"] = resolved_question
-        intent_result["retrieval_query"] = rewritten_question
-        if emit_intent:
-            yield {"type": "intent", "content": intent_result}
-
-        # 步骤2-3：意图路由（检索+重排序）
-        if emit_thinking:
-            if use_graph and intent_result["use_graph"]:
-                yield _thinking("🔍 正在查询知识图谱...")
-            else:
-                yield _thinking("🔍 正在检索相关文档...")
-
-        reranked, _route_strategy = await self.intent_router.route(
-            intent_result,
-            rewritten_question,
-            graph_enabled=use_graph,
-        )
-
-        if emit_thinking:
-            if reranked:
-                graph_count = sum(1 for d in reranked if d.get("retrieval_source") == "graph")
-                vector_count = len(reranked) - graph_count
-                yield _thinking(f"✓ 检索完成: 图谱{graph_count}条, 向量{vector_count}条")
-                yield _thinking("⚡ 正在重排序优化结果...")
-            else:
-                yield _thinking("⚠️ 未找到相关文档")
-
-        # 步骤4：上下文构建
-        builder = ContextBuilder()
-        tel.start("build_context")
-        context, ctx_stats = builder.build_retrieval_context(
-            reranked or [],
-            max_tokens=settings.MAX_CONTEXT_TOKENS,
-        )
-        ctx_evt = tel.end("build_context", **ctx_stats)
-        if emit_thinking and ctx_evt:
-            yield _thinking(f"⏱️ build_context: {ctx_evt['duration_ms']}ms")
-        if emit_thinking and context:
-            yield _thinking(f"📝 构建上下文: {len(context)}字符")
-        if emit_thinking:
-            yield _thinking(f"📦 上下文预算: {ctx_stats.get('context_tokens', 0)} tokens, 文档{ctx_stats.get('context_docs_included', 0)}条")
-        if emit_thinking:
-            yield _thinking("💡 正在生成回答...\n")
-
-        # 步骤5：流式生成回答（两条链路共用，避免行为分叉）
-        llm = OpenAILLM.from_provider(provider=model_provider, model_name=model_name)
-        messages = llm.build_rag_messages(question, context, chat_history)
         full_answer = ""
-        first_token = True
-        tel.start("llm_stream")
-        async for token in llm.generate_stream(messages):
-            if first_token:
-                first_token = False
-                if emit_thinking:
-                    yield _thinking("⏱️ 首 token 已返回")
-            full_answer += token
-            yield {"type": "token", "content": token}
-        llm_evt = tel.end("llm_stream", output_chars=len(full_answer))
-        if emit_thinking and llm_evt:
-            yield _thinking(f"⏱️ llm_stream: {llm_evt['duration_ms']}ms")
+        sources: List[Dict] = []
+        first_token_seen_at: Optional[float] = None
+        t_request_start = time.perf_counter()
 
-        # 步骤6：构建来源信息（用于回传与会话持久化）
-        sources = [
-            {
-                "title": doc.get("title", "未知来源"),
-                "content": doc.get("text", "")[:300],
-                "page": self._normalize_page(doc.get("page")),
-                "retrieval_source": doc.get("retrieval_source", "unknown"),
-            }
-            for doc in (reranked[:5] if reranked else [])
-        ]
-
-        if persist and self.memory_manager:
+        with tracing_context(parent=run):
             try:
-                self.memory_manager.short_term.add_message(session_id, "assistant", full_answer)
-            except Exception:
-                pass
-
-            if user_id:
-                try:
-                    self.memory_manager.long_term.add_consultation(
-                        user_id, question, full_answer, intent_result["intent"]
+                if not self.initialized:
+                    if emit_thinking:
+                        yield _thinking("⏳ 正在初始化检索与模型组件，请稍候...")
+                    _init_start, init_t0 = span_times()
+                    init_span = run.create_child(
+                        name="initialize",
+                        run_type="tool",
+                        inputs={},
                     )
-                except Exception as e:
-                    print(f"保存咨询历史失败: {e}")
+                    init_span.post()
+                    await self.initialize()
+                    init_span.end(
+                        outputs={"initialized": True, "duration_ms": perf_ms_since(init_t0)},
+                        metadata={"duration_ms": perf_ms_since(init_t0)},
+                    )
+                    init_span.patch()
+                    if emit_thinking:
+                        yield _thinking("✅ 初始化完成，开始处理请求...")
 
-        # 会话存储：写入助手回复
-        if persist and user_id and self.session_store:
-            try:
-                import uuid
+                # 记忆/会话持久化：仅在流式链路（或显式需要）时启用，避免非流式副作用
+                if persist:
+                    if self.memory_manager:
+                        if not chat_history and user_id:
+                            try:
+                                history = self.memory_manager.short_term.get_history(session_id, limit=2)
+                                chat_history = [{"role": h["role"], "content": h["content"]} for h in history[-4:]]
+                            except Exception as e:
+                                print(f"获取短期记忆失败: {e}")
+                                chat_history = []
+                        try:
+                            self.memory_manager.short_term.add_message(session_id, "user", question)
+                        except Exception as e:
+                            print(f"保存短期记忆失败（Redis可能未启动）: {e}")
 
-                self.session_store.add_message(
-                    message_id=str(uuid.uuid4()),
-                    session_id=session_id,
-                    user_id=user_id,
-                    mode="rag",
-                    role="assistant",
-                    content=full_answer,
-                    sources=sources,
-                    thinking_steps=thinking_steps if thinking_steps else None,
+                    if (not chat_history) and user_id and self.session_store:
+                        try:
+                            rows = self.session_store.list_messages(
+                                session_id=session_id,
+                                user_id=user_id,
+                                mode="rag",
+                                limit=50,
+                            )
+                            chat_history = [{"role": m.role, "content": m.content} for m in rows]
+                        except Exception as e:
+                            print(f"从会话存储恢复历史失败: {e}")
+
+                    if user_id and self.session_store:
+                        try:
+                            import uuid
+
+                            self.session_store.add_message(
+                                message_id=str(uuid.uuid4()),
+                                session_id=session_id,
+                                user_id=user_id,
+                                mode="rag",
+                                role="user",
+                                content=question,
+                            )
+                        except Exception as e:
+                            print(f"写入会话消息失败: {e}")
+
+                # 步骤0：上下文消解
+                original_question = question
+                resolved_question = question
+                if chat_history and len(chat_history) >= 2 and self.context_resolver:
+                    if emit_thinking:
+                        yield _thinking("🔗 正在消解上下文指代...")
+                    _cr_start, cr_t0 = span_times()
+                    cr_span = run.create_child(
+                        name="context_resolve",
+                        run_type="tool",
+                        inputs={"question": question, "chat_history": chat_history},
+                    )
+                    cr_span.post()
+                    resolved_question, _extracted_entity = await self.context_resolver.resolve_query(question, chat_history)
+                    cr_span.end(
+                        outputs={"resolved_question": resolved_question, "duration_ms": perf_ms_since(cr_t0)},
+                        metadata={"duration_ms": perf_ms_since(cr_t0)},
+                    )
+                    cr_span.patch()
+                    if resolved_question != question:
+                        if emit_thinking:
+                            yield _thinking(f"✓ 消解后: {resolved_question}")
+                        question = resolved_question
+
+                # 步骤1：意图识别
+                if emit_thinking:
+                    yield _thinking("🤔 正在分析问题意图...")
+                tel.start("intent_classify")
+                _intent_start, intent_t0 = span_times()
+                intent_span = run.create_child(
+                    name="intent_classify",
+                    run_type="tool",
+                    inputs={"question": question},
                 )
-            except Exception as e:
-                print(f"写入会话消息失败: {e}")
+                intent_span.post()
+                intent_result = await self.intent_classifier.classify(question)
+                intent_span.end(
+                    outputs={**intent_result, "duration_ms": perf_ms_since(intent_t0)},
+                    metadata={"duration_ms": perf_ms_since(intent_t0)},
+                )
+                intent_span.patch()
+                intent_evt = tel.end(
+                    "intent_classify",
+                    intent=intent_result.get("intent"),
+                    confidence=float(intent_result.get("confidence", 0.0)),
+                )
+                if emit_thinking and intent_evt:
+                    yield _thinking(f"⏱️ intent_classify: {intent_evt['duration_ms']}ms")
+                if not use_graph:
+                    intent_result["use_graph"] = False
 
-        yield {"type": "sources", "content": sources}
-        total_evt = tel.end("rag_total")
-        if emit_thinking and total_evt:
-            yield _thinking(f"⏱️ total: {total_evt['duration_ms']}ms")
-        yield {"type": "done", "content": ""}
+                intent_desc = {
+                    "greeting": "问候",
+                    "thanks": "感谢",
+                    "disease_drug": "疾病用药查询",
+                    "disease_symptom": "疾病症状查询",
+                    "drug_contraindication": "药品禁忌查询",
+                    "disease_department": "疾病科室查询",
+                    "disease_food": "疾病饮食查询",
+                    "symptom_disease": "症状反查疾病",
+                    "general_medical": "一般医疗问答",
+                    "out_of_scope": "非医疗问题",
+                }.get(intent_result["intent"], "未知")
+
+                if emit_thinking:
+                    yield {
+                        "type": "thinking",
+                        "content": f"✓ 识别意图: {intent_desc} (置信度: {intent_result['confidence']:.0%})",
+                    }
+                    thinking_steps.append(f"✓ 识别意图: {intent_desc} (置信度: {intent_result['confidence']:.0%})")
+
+                # 步骤1.5：问题改写
+                if intent_result["intent"] not in ["greeting", "thanks", "out_of_scope"]:
+                    if emit_thinking:
+                        yield _thinking("🔄 正在优化问题表述...")
+                    tel.start("rewrite")
+                    _rw_start, rw_t0 = span_times()
+                    rw_span = run.create_child(
+                        name="rewrite",
+                        run_type="tool",
+                        inputs={"question": question, "chat_history": chat_history},
+                    )
+                    rw_span.post()
+                    rewritten_question = await self.rewrite_chain.rewrite(question, chat_history)
+                    rw_span.end(
+                        outputs={"rewritten_question": rewritten_question, "duration_ms": perf_ms_since(rw_t0)},
+                        metadata={"duration_ms": perf_ms_since(rw_t0)},
+                    )
+                    rw_span.patch()
+                    rw_evt = tel.end("rewrite")
+                    if emit_thinking and rw_evt:
+                        yield _thinking(f"⏱️ rewrite: {rw_evt['duration_ms']}ms")
+                    if rewritten_question != question and emit_thinking:
+                        yield _thinking(f"✓ 问题改写: {rewritten_question}")
+                else:
+                    rewritten_question = question
+
+                intent_result["raw_question"] = original_question
+                intent_result["resolved_question"] = resolved_question
+                intent_result["retrieval_query"] = rewritten_question
+                if emit_intent:
+                    yield {"type": "intent", "content": intent_result}
+
+                # 步骤2-3：检索+重排序
+                if emit_thinking:
+                    if use_graph and intent_result.get("use_graph"):
+                        yield _thinking("🔍 正在查询知识图谱...")
+                    else:
+                        yield _thinking("🔍 正在检索相关文档...")
+
+                _route_start, route_t0 = span_times()
+                route_span = run.create_child(
+                    name="retrieve_and_rerank",
+                    run_type="retriever",
+                    inputs={"intent": intent_result, "query": rewritten_question, "graph_enabled": use_graph},
+                )
+                route_span.post()
+                reranked, _route_strategy = await self.intent_router.route(
+                    intent_result,
+                    rewritten_question,
+                    graph_enabled=use_graph,
+                )
+                route_span.end(
+                    outputs={"docs": reranked or [], "route_strategy": _route_strategy, "duration_ms": perf_ms_since(route_t0)},
+                    metadata={"duration_ms": perf_ms_since(route_t0)},
+                )
+                route_span.patch()
+
+                if emit_thinking:
+                    if reranked:
+                        graph_count = sum(1 for d in reranked if d.get("retrieval_source") == "graph")
+                        vector_count = len(reranked) - graph_count
+                        yield _thinking(f"✓ 检索完成: 图谱{graph_count}条, 向量{vector_count}条")
+                        yield _thinking("⚡ 正在重排序优化结果...")
+                    else:
+                        yield _thinking("⚠️ 未找到相关文档")
+
+                # 步骤4：上下文构建
+                builder = ContextBuilder()
+                tel.start("build_context")
+                _ctx_start, ctx_t0 = span_times()
+                ctx_span = run.create_child(
+                    name="build_context",
+                    run_type="tool",
+                    inputs={"docs": reranked or [], "max_tokens": settings.MAX_CONTEXT_TOKENS},
+                )
+                ctx_span.post()
+                context, ctx_stats = builder.build_retrieval_context(
+                    reranked or [],
+                    max_tokens=settings.MAX_CONTEXT_TOKENS,
+                )
+                ctx_span.end(
+                    outputs={"context": context, "stats": ctx_stats, "duration_ms": perf_ms_since(ctx_t0)},
+                    metadata={"duration_ms": perf_ms_since(ctx_t0)},
+                )
+                ctx_span.patch()
+                ctx_evt = tel.end("build_context", **ctx_stats)
+                if emit_thinking and ctx_evt:
+                    yield _thinking(f"⏱️ build_context: {ctx_evt['duration_ms']}ms")
+                if emit_thinking and context:
+                    yield _thinking(f"📝 构建上下文: {len(context)}字符")
+                if emit_thinking:
+                    yield _thinking(
+                        f"📦 上下文预算: {ctx_stats.get('context_tokens', 0)} tokens, 文档{ctx_stats.get('context_docs_included', 0)}条"
+                    )
+                    yield _thinking("💡 正在生成回答...\n")
+
+                # 步骤5：流式生成回答
+                llm = OpenAILLM.from_provider(provider=model_provider, model_name=model_name)
+                messages = llm.build_rag_messages(question, context, chat_history)
+                first_token = True
+                tel.start("llm_stream")
+                _llm_start, llm_t0 = span_times()
+                llm_span = run.create_child(
+                    name="llm_stream",
+                    run_type="llm",
+                    inputs={
+                        "model": llm.model,
+                        "messages": messages,
+                        "temperature": 0.7,
+                        "max_tokens": settings.MAX_OUTPUT_TOKENS,
+                    },
+                )
+                llm_span.post()
+                async for token in llm.generate_stream(messages):
+                    if first_token:
+                        first_token = False
+                        first_token_seen_at = time.perf_counter()
+                        if emit_thinking:
+                            yield _thinking("⏱️ 首 token 已返回")
+                    full_answer += token
+                    yield {"type": "token", "content": token}
+
+                # Some providers/models (e.g. DeepSeek reasoner) may stream only reasoning fields and leave
+                # user-visible content empty. If we ended up with an empty answer, fall back to a single
+                # non-stream completion to get the final answer content.
+                if not full_answer.strip():
+                    try:
+                        # If the selected model is a "reasoner" that doesn't return user-visible content,
+                        # fall back to a chat model to produce the final answer text (without reasoning).
+                        fallback_llm = llm
+                        try:
+                            if (model_provider or "").lower() == "deepseek" and "reasoner" in (llm.model or ""):
+                                fallback_llm = OpenAILLM.from_provider(provider="deepseek", model_name="deepseek-chat")
+                        except Exception:
+                            fallback_llm = llm
+
+                        fallback_text = await fallback_llm.generate(
+                            messages,
+                            temperature=0.7,
+                            max_tokens=settings.MAX_OUTPUT_TOKENS,
+                        )
+                        full_answer = (fallback_text or "").strip()
+                        if full_answer:
+                            # Emit as one token event for SSE clients; non-stream callers will still
+                            # build the final answer from these token events.
+                            yield {"type": "token", "content": full_answer}
+                    except Exception:
+                        # If fallback fails, keep empty answer; caller will handle downstream.
+                        pass
+                llm_span.end(
+                    outputs={
+                        "answer": full_answer,
+                        "output_chars": len(full_answer),
+                        "time_to_first_token_ms": (
+                            int((first_token_seen_at - t_request_start) * 1000) if first_token_seen_at else None
+                        ),
+                        "duration_ms": perf_ms_since(llm_t0),
+                    }
+                    ,
+                    metadata={"duration_ms": perf_ms_since(llm_t0)},
+                )
+                llm_span.patch()
+                llm_evt = tel.end("llm_stream", output_chars=len(full_answer))
+                if emit_thinking and llm_evt:
+                    yield _thinking(f"⏱️ llm_stream: {llm_evt['duration_ms']}ms")
+
+                # 步骤6：来源信息
+                sources = [
+                    {
+                        "title": doc.get("title", "未知来源"),
+                        "content": doc.get("text", "")[:300],
+                        "page": self._normalize_page(doc.get("page")),
+                        "retrieval_source": doc.get("retrieval_source", "unknown"),
+                    }
+                    for doc in (reranked[:5] if reranked else [])
+                ]
+
+                if persist and self.memory_manager:
+                    try:
+                        self.memory_manager.short_term.add_message(session_id, "assistant", full_answer)
+                    except Exception:
+                        pass
+                    if user_id:
+                        try:
+                            self.memory_manager.long_term.add_consultation(
+                                user_id, question, full_answer, intent_result["intent"]
+                            )
+                        except Exception as e:
+                            print(f"保存咨询历史失败: {e}")
+
+                if persist and user_id and self.session_store:
+                    try:
+                        import uuid
+
+                        self.session_store.add_message(
+                            message_id=str(uuid.uuid4()),
+                            session_id=session_id,
+                            user_id=user_id,
+                            mode="rag",
+                            role="assistant",
+                            content=full_answer,
+                            sources=sources,
+                            thinking_steps=thinking_steps if thinking_steps else None,
+                        )
+                    except Exception as e:
+                        print(f"写入会话消息失败: {e}")
+
+                yield {"type": "sources", "content": sources}
+                total_evt = tel.end("rag_total")
+                if emit_thinking and total_evt:
+                    yield _thinking(f"⏱️ total: {total_evt['duration_ms']}ms")
+
+                run.end(
+                    outputs={
+                        "answer": full_answer,
+                        "sources": sources,
+                        "output_chars": len(full_answer),
+                        "sources_count": len(sources),
+                        "duration_ms": perf_ms_since(run_t0),
+                    },
+                    metadata={"duration_ms": perf_ms_since(run_t0)},
+                )
+                run.patch()
+                yield {"type": "done", "content": ""}
+            except Exception as e:
+                run.end(
+                    error=str(e),
+                    end_time=now_utc(),
+                    metadata={"duration_ms": perf_ms_since(run_t0)},
+                )
+                run.post()
+                raise
 
     async def query(
         self,

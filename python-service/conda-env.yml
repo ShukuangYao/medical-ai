@@ -1,0 +1,14 @@
+name: medical-ai-py311
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  # Optional but recommended: avoids SSL issues on some machines
+  - certifi
+  - openssl
+  - ca-certificates
+  # Install PyTorch via conda to avoid pip wheel issues.
+  - pytorch
+  - torchvision
+  - torchaudio

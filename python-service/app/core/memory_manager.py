@@ -4,12 +4,15 @@ import json
 import redis
 from datetime import datetime
 
+from app.config import settings
+
 
 class ShortTermMemory:
     """短期记忆 - Redis存储会话上下文"""
 
-    def __init__(self, redis_url: str = "redis://localhost:6379", ttl: int = 3600):
-        self.client = redis.from_url(redis_url, decode_responses=True)
+    def __init__(self, redis_url: Optional[str] = None, ttl: int = 3600):
+        effective_url = redis_url or settings.REDIS_URL
+        self.client = redis.from_url(effective_url, decode_responses=True)
         self.ttl = ttl  # 默认1小时过期
         self.max_turns = 10  # 最多保留10轮对话
 
@@ -230,8 +233,7 @@ class LongTermMemory:
 class MemoryManager:
     """统一记忆管理器"""
 
-    def __init__(self, redis_url: str = "redis://localhost:6379",
-                 db_path: str = "data/user_profiles.db"):
+    def __init__(self, redis_url: Optional[str] = None, db_path: str = "data/user_profiles.db"):
         self.short_term = ShortTermMemory(redis_url)
         self.long_term = LongTermMemory(db_path)
 

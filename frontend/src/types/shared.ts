@@ -4,6 +4,7 @@ export type ModelProvider = 'qwen' | 'deepseek'
 export type QwenModel = 'qwen-turbo' | 'qwen-plus' | 'qwen-max'
 export type DeepseekModel = 'deepseek-reasoner' | 'deepseek-chat'
 export type ModelName = QwenModel | DeepseekModel
+export type AgentPipeline = 'fast' | 'full'
 
 export type TriageSeverity = 'emergency' | 'urgent' | 'routine'
 
@@ -94,6 +95,8 @@ export interface ChatRequest {
   chatHistory?: Array<{ role: 'user' | 'assistant'; content: string }>
   modelProvider?: ModelProvider
   modelName?: ModelName
+  /** Agent tab only: fast merges steps; full restores legacy multi-step agents (slower, richer). */
+  agentPipeline?: AgentPipeline
 }
 
 export interface ChatResponse {
