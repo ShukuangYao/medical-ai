@@ -429,14 +429,21 @@ class MedicalAgentOrchestrator:
             return t
         return t[:max_chars] + "..."
 
-    async def _retrieve_evidence(self, *, query: str, intent_result: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict[str, Any]], str]:
+    @staticmethod
+    def _evidence_tool_error_event(e: ToolError) -> Dict[str, Any]:
+        """SSE payload aligned with RAG stream ToolError handling (code/retriable/detail)."""
+        return {"type": "error", "content": e.message, "phase": "evidence_retrieval", **e.to_event_fields()}
+
+    async def _retrieve_evidence(
+        self, *, query: str, intent_result: Optional[Dict[str, Any]] = None
+    ) -> Tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
         """
         Retrieve sources for grounding (retrieval-only; no LLM generation).
-        Returns: (sources, short_text_snippet)
+        Returns: (sources, short_text_snippet, sse_error_events)
         """
         q = (query or "").strip()
         if not q:
-            return [], "未检索到可用参考资料"
+            return [], "未检索到可用参考资料", []
 
         # Cache for 5 minutes to avoid repeated rerank on same query.
         try:
@@ -444,12 +451,13 @@ class MedicalAgentOrchestrator:
             if cached:
                 ts, sources, brief = cached
                 if time.time() - ts < 300 and sources:
-                    return sources, brief
+                    return sources, brief, []
         except Exception:
             pass
 
         sources: List[Dict[str, Any]] = []
         brief: List[str] = []
+        sse_errors: List[Dict[str, Any]] = []
         try:
             ir = intent_result or {}
             intent = str(ir.get("intent") or "general_medical")
@@ -462,22 +470,31 @@ class MedicalAgentOrchestrator:
                 ctx = ToolContext(mode="agent")
                 graph_docs: List[Dict[str, Any]] = []
                 if use_graph and entity:
-                    graph_docs = await self.tools.run(
-                        "graph_query",
-                        args={"intent": intent, "entity": str(entity)},
+                    try:
+                        graph_docs = await self.tools.run(
+                            "graph_query",
+                            args={"intent": intent, "entity": str(entity)},
+                            ctx=ctx,
+                            trace_inputs={"intent": intent, "entity": str(entity)},
+                            idempotency_key=f"graph_query:{intent}:{entity}",
+                            idempotency_ttl_s=300.0,
+                        )
+                    except ToolError as e:
+                        sse_errors.append(self._evidence_tool_error_event(e))
+                        graph_docs = []
+                hybrid_docs: List[Dict[str, Any]] = []
+                try:
+                    hybrid_docs = await self.tools.run(
+                        "hybrid_retrieve",
+                        args={"query": q},
                         ctx=ctx,
-                        trace_inputs={"intent": intent, "entity": str(entity)},
-                        idempotency_key=f"graph_query:{intent}:{entity}",
+                        trace_inputs={"query": q},
+                        idempotency_key=f"hybrid_retrieve:{q}",
                         idempotency_ttl_s=300.0,
                     )
-                hybrid_docs = await self.tools.run(
-                    "hybrid_retrieve",
-                    args={"query": q},
-                    ctx=ctx,
-                    trace_inputs={"query": q},
-                    idempotency_key=f"hybrid_retrieve:{q}",
-                    idempotency_ttl_s=300.0,
-                )
+                except ToolError as e:
+                    sse_errors.append(self._evidence_tool_error_event(e))
+                    hybrid_docs = []
 
                 # Deduplicate: graph first
                 all_docs = list(graph_docs) + list(hybrid_docs or [])
@@ -499,25 +516,33 @@ class MedicalAgentOrchestrator:
                 if len(supplement) > 8:
                     supplement = sorted(supplement, key=lambda d: float(d.get("score", 0.0)), reverse=True)[:8]
                 if len(supplement) > 6:
-                    supplement = await self.tools.run(
-                        "rerank",
-                        args={"query": q, "docs": supplement, "top_k": 8},
-                        ctx=ctx,
-                        trace_inputs={"query": q, "docs_count": len(supplement), "top_k": 8},
-                        idempotency_key=f"rerank:{q}:{len(supplement)}",
-                        idempotency_ttl_s=300.0,
-                    )
+                    try:
+                        supplement = await self.tools.run(
+                            "rerank",
+                            args={"query": q, "docs": supplement, "top_k": 8},
+                            ctx=ctx,
+                            trace_inputs={"query": q, "docs_count": len(supplement), "top_k": 8},
+                            idempotency_key=f"rerank:{q}:{len(supplement)}",
+                            idempotency_ttl_s=300.0,
+                        )
+                    except ToolError as e:
+                        sse_errors.append(self._evidence_tool_error_event(e))
+                        supplement = supplement[:8]
                 docs = (graph_kept + supplement)[:10]
             else:
                 # Fallback to legacy router (keeps behavior if tools init fails)
                 router = getattr(self.rag, "intent_router", None)
                 if router is None:
-                    return [], "未检索到可用参考资料"
-                docs, _strategy = await router.route(
-                    {"intent": intent, "entity": entity, "use_graph": use_graph},
-                    q,
-                    graph_enabled=True,
-                )
+                    return [], "未检索到可用参考资料", sse_errors
+                try:
+                    docs, _strategy = await router.route(
+                        {"intent": intent, "entity": entity, "use_graph": use_graph},
+                        q,
+                        graph_enabled=True,
+                    )
+                except ToolError as e:
+                    sse_errors.append(self._evidence_tool_error_event(e))
+                    docs = []
 
             for doc in (docs or [])[:5]:
                 src = {
@@ -530,9 +555,6 @@ class MedicalAgentOrchestrator:
                 title = src.get("title", "source")
                 content = (src.get("content") or "")[:180]
                 brief.append(f"- {title}: {content}")
-        except ToolError:
-            # Tool boundary already recorded span error; degrade gracefully.
-            pass
         except Exception:
             pass
         brief_text = "\n".join(brief) if brief else "未检索到可用参考资料"
@@ -540,7 +562,7 @@ class MedicalAgentOrchestrator:
             self._evidence_cache[q] = (time.time(), sources, brief_text)
         except Exception:
             pass
-        return sources, brief_text
+        return sources, brief_text, sse_errors
 
     async def diagnose_stream(
         self,
@@ -936,7 +958,7 @@ class MedicalAgentOrchestrator:
                 sources: List[Dict[str, Any]] = []
                 sources_brief: str = "未检索到可用参考资料"
 
-                async def _await_retrieve_full() -> Tuple[List[Dict[str, Any]], str]:
+                async def _await_retrieve_full() -> Tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
                     try:
                         cap = float(getattr(settings, "AGENT_EVIDENCE_TIMEOUT_FULL_S", 25.0))
                         return await asyncio.wait_for(retrieve_task, timeout=cap)
@@ -945,22 +967,26 @@ class MedicalAgentOrchestrator:
                             retrieve_task.cancel()
                         except Exception:
                             pass
-                        return [], "未检索到可用参考资料"
+                        return [], "未检索到可用参考资料", []
 
                 if agent_pipeline == "full":
                     # NOTE: do NOT wait for triage/safety here; they can be slow and would block downstream steps.
                     # We only await retrieval budget here to populate sources early (if available).
-                    sources, sources_brief = await _await_retrieve_full()
+                    sources, sources_brief, evidence_sse_errors = await _await_retrieve_full()
                 else:
                     try:
                         cap = float(getattr(settings, "AGENT_EVIDENCE_TIMEOUT_FAST_S", 10.0))
-                        sources, sources_brief = await asyncio.wait_for(retrieve_task, timeout=cap)
+                        sources, sources_brief, evidence_sse_errors = await asyncio.wait_for(
+                            retrieve_task, timeout=cap
+                        )
                     except Exception:
                         try:
                             retrieve_task.cancel()
                         except Exception:
                             pass
-                        sources, sources_brief = [], "未检索到可用参考资料"
+                        sources, sources_brief, evidence_sse_errors = [], "未检索到可用参考资料", []
+                for _err_evt in evidence_sse_errors:
+                    yield _err_evt
                 ev_span.end(outputs={"sources": sources, "sources_brief": sources_brief})
                 ev_span.patch()
                 if sources:

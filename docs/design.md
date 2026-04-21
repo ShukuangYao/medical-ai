@@ -106,7 +106,7 @@ flowchart TB
 来源：`python-service/app/routers/*.py`
 
 - **RAG**
-  - `POST /api/rag`：非流式 `{answer, sources}`（当带 `user_id` 时也会落库）
+  - `POST /api/rag`：非流式 `{answer, sources, errors}`（`errors` 恒为数组，与流式 `type=error` 剥离 `type` 后的对象结构一致；无错误时为 `[]`。当带 `user_id` 时也会落库）
   - `POST /api/rag/stream`：SSE 事件流
 - **Agent**
   - `POST /api/agent`：非流式 `ChatResponse`（内部消费 `diagnose_stream`；当带 `user_id` 时会落库）
@@ -132,6 +132,32 @@ flowchart TB
 > - `request_id?: string`：一次 HTTP 请求的关联 ID（Node 生成，贯通 Node→Python→SSE→LangSmith）
 > - `run_id?: string`：一次生成/流式运行的关联 ID（Node 生成；后续 cancel/feedback 的主键）
 > - `seq?: number`：事件序号（同一条 SSE 流内单调递增，便于调试与断线续传对齐）
+> - `phase?: string`：业务阶段标签，**主要用于 `type=error`**，便于前端分区展示与统计；未出现时表示未标注（兼容旧事件）
+
+### `type=error` 与 `phase`（契约）
+
+来源：`python-service/app/core/tools/base.py`（`ToolError.to_event_fields()`）、`rag_engine.py`、`agent_orchestrator.py`。
+
+流式 SSE 中 **`type` 为 `error`** 时，除通用 Envelope 字段外，约定如下（与工具层对齐）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `content` | `string` | 可读错误信息（主文案） |
+| `code` | `string` | 机器可读错误码（如 `VALIDATION_ERROR` / `INTERNAL` / `NOT_FOUND`） |
+| `retriable` | `boolean` | 是否可重试（由 `ToolError` 决定） |
+| `detail` | `object?` | 结构化补充（如校验错误列表），可选 |
+| `upstream_status` | `number?` | 上游 HTTP 状态等，可选 |
+| `phase` | `string?` | **业务阶段**：标明失败发生在哪一段管道；当前实现示例见下表 |
+
+**`phase` 取值（当前仓库）**：
+
+| `phase` | 出现场景 |
+|---------|----------|
+| `evidence_retrieval` | 病历分析（Agent）中 `_retrieve_evidence` 内 `graph_query` / `hybrid_retrieve` / `rerank` 或 legacy `intent_router.route` 抛出 `ToolError` 后仍降级继续编排时，随 SSE 推送 |
+
+未设置 `phase` 的 `error` 事件仍合法（例如 RAG 中部分路径尚未标注阶段）；客户端应 **忽略未知 `phase`**。
+
+**非流式 RAG**：`POST /api/rag` 的 JSON 响应 **固定包含** `errors: []`，元素形状与上表一致（不含顶层 `type`，因非 SSE）。
 
 ### request_id / run_id 生成与传递（SSOT）
 
@@ -156,7 +182,7 @@ flowchart TB
 - `token: string`：流式 token
 - `sources: Source[]`：来源（最多 5 条摘要）
 - `done: ""`：结束
-- `error: string`：异常（由路由或网关包装）
+- `error`：`content` 为可读信息；工具/管道失败时携带 `code` / `retriable` / 可选 `detail` / 可选 `phase`（见上文「`type=error` 与 `phase`」）
 
 ### Agent SSE（`POST /api/agent/stream`）
 
@@ -167,7 +193,7 @@ flowchart TB
 - `agent_step: {agent, step, detail}`：阶段产出
 - `sources: Source[]`：可选参考资料
 - `result: AgentReport`：最终结构化报告
-- `error: string`
+- `error`：同 RAG；检索降级场景下可出现 **`phase: "evidence_retrieval"`**
 - `done: ""`
 
 ### Node 注入事件

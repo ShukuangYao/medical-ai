@@ -66,6 +66,7 @@ async def rag_query(request: Request):
         # We reuse the stream pipeline (persist=True) but consume events to build the final response.
         answer_parts = []
         sources = []
+        stream_errors = []
         with tracing_context(parent=root):
             async for evt in rag_engine.query_stream(
                 question,
@@ -76,18 +77,27 @@ async def rag_query(request: Request):
                 model_provider=model_provider,
                 model_name=model_name,
             ):
-                if evt.get("type") == "token":
+                et = evt.get("type")
+                if et == "token":
                     answer_parts.append(evt.get("content") or "")
-                elif evt.get("type") == "sources":
+                elif et == "sources":
                     sources = evt.get("content") or []
+                elif et == "error":
+                    # ToolError / pipeline errors include `code`, `retriable`, optional `detail` (see ToolError.to_event_fields).
+                    stream_errors.append({k: v for k, v in evt.items() if k != "type"})
 
         answer = "".join(answer_parts)
         root.end(
-            outputs={"answer": answer, "sources": sources, "elapsed_ms": int((time.perf_counter() - t0) * 1000)},
+            outputs={
+                "answer": answer,
+                "sources": sources,
+                "errors": stream_errors,
+                "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+            },
             end_time=datetime.now(timezone.utc),
         )
         root.post()
-        return {"answer": answer, "sources": sources}
+        return {"answer": answer, "sources": sources, "errors": stream_errors}
     except Exception as e:
         try:
             root.end(error=str(e))  # type: ignore[name-defined]
