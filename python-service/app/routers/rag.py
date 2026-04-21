@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from app.core.singletons import rag_engine, ensure_rag_initialized
 from app.core.sse_envelope import sse_context_from_request, sse_envelope, sse_data_line
+from app.core.run_cancel import clear_run
 
 from langsmith import RunTree
 from langsmith.run_helpers import get_current_run_tree, tracing_context
@@ -62,6 +63,8 @@ async def rag_query(request: Request):
         root.post()
         t0 = time.perf_counter()
 
+        sse_ctx_ns = sse_context_from_request(request)
+
         # For non-stream calls, we also persist to session storage.
         # We reuse the stream pipeline (persist=True) but consume events to build the final response.
         answer_parts = []
@@ -76,6 +79,7 @@ async def rag_query(request: Request):
                 user_id=user_id,
                 model_provider=model_provider,
                 model_name=model_name,
+                cancel_run_id=(sse_ctx_ns.run_id or None),
             ):
                 et = evt.get("type")
                 if et == "token":
@@ -163,6 +167,7 @@ async def rag_query_stream(request: Request):
             full = ""
             sources = []
             ended = False
+            rid = (sse_ctx.run_id or "").strip()
             try:
                 with tracing_context(parent=root):
                     # 先产出一个事件，确保客户端尽快收到响应头并开始渲染（避免初始化耗时导致“无输出”假象）
@@ -181,6 +186,7 @@ async def rag_query_stream(request: Request):
                         model_provider=model_provider,
                         model_name=model_name,
                         user_id=uid,
+                        cancel_run_id=rid or None,
                     ):
                         if chunk.get("type") == "token":
                             full += chunk.get("content") or ""
@@ -204,7 +210,7 @@ async def rag_query_stream(request: Request):
                 # Client disconnected / request cancelled; make sure the run is closed.
                 if not ended:
                     try:
-                        root.end(error="cancelled", end_time=datetime.now(timezone.utc))
+                        root.end(error="cancelled", metadata={"cancelled": True}, end_time=datetime.now(timezone.utc))
                         root.patch()
                     except Exception:
                         pass
@@ -226,6 +232,8 @@ async def rag_query_stream(request: Request):
                     pass
                 return
             finally:
+                if rid:
+                    clear_run(rid)
                 # Double-safety: close the run if we somehow exit without ending.
                 if not ended:
                     try:

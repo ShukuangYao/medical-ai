@@ -21,6 +21,7 @@ from app.core.tools.base import ToolContext, ToolError
 from app.core.tools.executor import ToolExecutor
 from app.core.tools.registry import ToolRegistry
 from app.core.tools.impl import GraphQueryTool, HybridRetrieveTool, RerankTool, RewriteQuestionTool
+from app.core.run_cancel import is_cancelled as run_cancelled
 
 from langsmith import RunTree
 from langsmith.run_helpers import get_current_run_tree, tracing_context
@@ -220,6 +221,31 @@ class MedicalAgentOrchestrator:
             p = "qwen"
         return model, base_url, p
 
+    def _agent_llm_client(self, agent: ConversableAgent) -> OpenAILLM:
+        """Build an OpenAILLM client from an AutoGen agent's llm_config.
+
+        This lets us run Agent(full) steps through our own llm_client, so cooperative cancel
+        can close upstream streams and end LLM spans early.
+        """
+        model, base_url, provider_guess = self._agent_llm_identity(agent)
+        api_key = settings.DASHSCOPE_API_KEY
+        if provider_guess == "deepseek":
+            api_key = settings.DEEPSEEK_API_KEY or settings.DASHSCOPE_API_KEY
+        # Use agent-specific base_url when present; fall back to settings defaults.
+        bu = (base_url or "").strip() or (
+            settings.DEEPSEEK_API_BASE if provider_guess == "deepseek" else settings.LLM_API_BASE
+        )
+        cache_key = f"{provider_guess}|{bu}|{model}"
+        cache = getattr(self, "_agent_llm_client_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_agent_llm_client_cache", cache)
+        llm = cache.get(cache_key)
+        if llm is None:
+            llm = OpenAILLM(api_key=api_key, base_url=bu, model=model)
+            cache[cache_key] = llm
+        return llm
+
     @classmethod
     def _agent_llm_span_name(cls, agent: ConversableAgent, logical_name: str) -> str:
         model, _, p = cls._agent_llm_identity(agent)
@@ -232,12 +258,40 @@ class MedicalAgentOrchestrator:
         # 把一个同步/耗时的函数 _run 放到线程池里执行
         return await asyncio.to_thread(_run)
 
-    async def _agent_reply_full(self, agent: ConversableAgent, prompt: str) -> str:
-        """`full` 管线专用：单步超时避免无限挂起；超时返回空对象 JSON。"""
+    async def _agent_reply_full(
+        self,
+        agent: ConversableAgent,
+        prompt: str,
+        *,
+        cancel_run_id: Optional[str] = None,
+    ) -> str:
+        """`full` 管线专用：单步超时避免无限挂起；支持 cooperative cancel（尽量中断上游请求）。"""
         cap = float(getattr(settings, "AGENT_FULL_LLM_STEP_TIMEOUT_S", 150.0))
+        llm = self._agent_llm_client(agent)
+        messages = [{"role": "user", "content": prompt}]
+        task = asyncio.create_task(
+            llm.generate(
+                messages,
+                temperature=0.2,
+                max_tokens=getattr(settings, "MAX_OUTPUT_TOKENS", 2048),
+                cancel_run_id=cancel_run_id,
+            )
+        )
         try:
-            return await asyncio.wait_for(self._agent_reply(agent, prompt), timeout=cap)
+            return await asyncio.wait_for(task, timeout=cap)
         except asyncio.TimeoutError:
+            task.cancel()
+            return "{}"
+        except asyncio.CancelledError:
+            task.cancel()
+            return "{}"
+        except Exception:
+            # Keep legacy behavior: downstream parsers expect JSON-ish strings; return "{}" on failure.
+            try:
+                if task and not task.done():
+                    task.cancel()
+            except Exception:
+                pass
             return "{}"
 
     async def _agent_reply_capped(self, agent: ConversableAgent, prompt: str, *, cap_s: float) -> str:
@@ -434,6 +488,22 @@ class MedicalAgentOrchestrator:
         """SSE payload aligned with RAG stream ToolError handling (code/retriable/detail)."""
         return {"type": "error", "content": e.message, "phase": "evidence_retrieval", **e.to_event_fields()}
 
+    @staticmethod
+    def _agent_cancel_requested(cancel_run_id: Optional[str]) -> bool:
+        return bool(cancel_run_id) and run_cancelled(cancel_run_id)
+
+    async def _agent_abort_stream(self, run: RunTree, t0: float) -> AsyncGenerator[Dict[str, Any], None]:
+        try:
+            run.end(
+                outputs={"cancelled": True, "elapsed_ms": int((time.perf_counter() - t0) * 1000)},
+                metadata={"cancelled": True},
+            )
+            run.patch()
+        except Exception:
+            pass
+        yield {"type": "thinking", "content": "— 已取消（服务器已停止后续步骤）"}
+        yield {"type": "done", "content": ""}
+
     async def _retrieve_evidence(
         self, *, query: str, intent_result: Optional[Dict[str, Any]] = None
     ) -> Tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
@@ -572,6 +642,7 @@ class MedicalAgentOrchestrator:
         model_name: Optional[str] = None,
         user_id: Optional[str] = None,
         agent_pipeline: Literal["fast", "full"] = "fast",
+        cancel_run_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict, None]:
         """
         流式输出病历分析过程（严格JSON）
@@ -637,8 +708,12 @@ class MedicalAgentOrchestrator:
         with tracing_context(parent=run):
             try:
                 run.post()
-                perf: Dict[str, Any] = {}
                 t0 = time.perf_counter()
+                if self._agent_cancel_requested(cancel_run_id):
+                    async for _ev in self._agent_abort_stream(run, t0):
+                        yield _ev
+                    return
+                perf: Dict[str, Any] = {}
                 raw_question = medical_record.strip()
 
                 # Recover recent session history (minimal context engineering; avoid feeding huge history)
@@ -685,7 +760,7 @@ class MedicalAgentOrchestrator:
                 )
                 intent_span.post()
                 intent_llm = OpenAILLM.from_provider(provider=model_provider, model_name=model_name)
-                intent_res = await HybridIntentClassifier(llm=intent_llm).classify(raw_question)
+                intent_res = await HybridIntentClassifier(llm=intent_llm).classify(raw_question, cancel_run_id=cancel_run_id)
                 intent_span.end(outputs=intent_res)
                 intent_span.patch()
                 intent_payload = {
@@ -698,6 +773,10 @@ class MedicalAgentOrchestrator:
                 self.conversation_history.append(
                     {"agent": "IntentAgent", "message": json.dumps(intent_payload, ensure_ascii=False)}
                 )
+                if self._agent_cancel_requested(cancel_run_id):
+                    async for _ev in self._agent_abort_stream(run, t0):
+                        yield _ev
+                    return
 
                 # Guardrail: refuse non-relevant questions in Agent (medical record analysis) mode.
                 # For chit-chat / non-medical, direct users to the RAG tab.
@@ -806,9 +885,16 @@ class MedicalAgentOrchestrator:
                     )
                     validator_span.post()
                     if not (cached and (now_s - float(cached[0])) <= cache_ttl):
-                        validator_text = await self._agent_reply_full(agents["validator"], validator_prompt)
-                        validator_span.end(outputs={"text": validator_text})
-                        validator_span.patch()
+                        try:
+                            validator_text = await self._agent_reply_full(
+                                agents["validator"], validator_prompt, cancel_run_id=cancel_run_id
+                            )
+                            validator_span.end(outputs={"text": validator_text})
+                            validator_span.patch()
+                        except asyncio.CancelledError:
+                            validator_span.end(error="cancelled", metadata={"cancelled": True})
+                            validator_span.patch()
+                            raise
                         validated_record = self._safe_json(validator_text)
                         yield {"type": "agent_step", "content": {"agent": "RecordValidator", "step": "validated_record", "detail": validated_record}}
                         self.conversation_history.append({"agent": "RecordValidator", "message": validator_text})
@@ -848,9 +934,16 @@ class MedicalAgentOrchestrator:
                             },
                         )
                         extractor_span.post()
-                        extractor_text = await self._agent_reply_full(agents["extractor"], extractor_prompt)
-                        extractor_span.end(outputs={"text": extractor_text})
-                        extractor_span.patch()
+                        try:
+                            extractor_text = await self._agent_reply_full(
+                                agents["extractor"], extractor_prompt, cancel_run_id=cancel_run_id
+                            )
+                            extractor_span.end(outputs={"text": extractor_text})
+                            extractor_span.patch()
+                        except asyncio.CancelledError:
+                            extractor_span.end(error="cancelled", metadata={"cancelled": True})
+                            extractor_span.patch()
+                            raise
                         structured_case = self._safe_json(extractor_text)
                         yield {"type": "agent_step", "content": {"agent": "SymptomExtractor", "step": "structured_case", "detail": structured_case}}
                         self.conversation_history.append({"agent": "SymptomExtractor", "message": extractor_text})
@@ -939,12 +1032,19 @@ class MedicalAgentOrchestrator:
                 ]
                 retrieval_query = "；".join([p for p in retrieval_query_parts if p])
                 perf["evidence_query_chars"] = len(str(retrieval_query))
+                retrieve_task: Optional[asyncio.Task] = None
                 ev_span = run.create_child(
                     name="retrieve_evidence",
                     run_type="retriever",
                     inputs={"query": str(retrieval_query), "query_chars": len(str(retrieval_query))},
                 )
                 ev_span.post()
+                if self._agent_cancel_requested(cancel_run_id):
+                    ev_span.end(outputs={"cancelled": True})
+                    ev_span.patch()
+                    async for _ev in self._agent_abort_stream(run, t0):
+                        yield _ev
+                    return
                 retrieve_task = asyncio.create_task(
                     self._retrieve_evidence(query=str(retrieval_query), intent_result=intent_res)
                 )
@@ -987,6 +1087,18 @@ class MedicalAgentOrchestrator:
                         sources, sources_brief, evidence_sse_errors = [], "未检索到可用参考资料", []
                 for _err_evt in evidence_sse_errors:
                     yield _err_evt
+                if self._agent_cancel_requested(cancel_run_id):
+                    if retrieve_task is not None and not retrieve_task.done():
+                        retrieve_task.cancel()
+                        try:
+                            await retrieve_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    ev_span.end(outputs={"sources": sources, "sources_brief": sources_brief, "cancelled": True})
+                    ev_span.patch()
+                    async for _ev in self._agent_abort_stream(run, t0):
+                        yield _ev
+                    return
                 ev_span.end(outputs={"sources": sources, "sources_brief": sources_brief})
                 ev_span.patch()
                 if sources:
@@ -1001,6 +1113,10 @@ class MedicalAgentOrchestrator:
 
                 if agent_pipeline == "full":
                     # Legacy multi-agent path: separate LLM calls + coordinator merge
+                    if self._agent_cancel_requested(cancel_run_id):
+                        async for _ev in self._agent_abort_stream(run, t0):
+                            yield _ev
+                        return
                     yield _thinking("病症分析 / 分诊科室 / 下一步安全（并行）...")
                     # Keep prompts short to reduce latency/cost while preserving accuracy:
                     # Condition analysis mainly needs key fields + brief evidence, not the full raw text.
@@ -1053,7 +1169,13 @@ class MedicalAgentOrchestrator:
 
                     async def _analyst_llm() -> str:
                         try:
-                            txt = await self._agent_reply_full(agents["analyst"], analyst_prompt)
+                            txt = await self._agent_reply_full(
+                                agents["analyst"], analyst_prompt, cancel_run_id=cancel_run_id
+                            )
+                        except asyncio.CancelledError:
+                            analyst_span.end(error="cancelled", metadata={"cancelled": True})
+                            analyst_span.patch()
+                            raise
                         except Exception as e:
                             analyst_span.end(error=str(e))
                             analyst_span.patch()
@@ -1135,9 +1257,20 @@ class MedicalAgentOrchestrator:
                     )
                     plan_safety_span.post()
 
+                    if self._agent_cancel_requested(cancel_run_id):
+                        async for _ev in self._agent_abort_stream(run, t0):
+                            yield _ev
+                        return
+
                     async def _triage_dept_llm() -> str:
                         try:
-                            txt = await self._agent_reply_full(agents["triage"], triage_dept_prompt)
+                            txt = await self._agent_reply_full(
+                                agents["triage"], triage_dept_prompt, cancel_run_id=cancel_run_id
+                            )
+                        except asyncio.CancelledError:
+                            triage_dept_span.end(error="cancelled", metadata={"cancelled": True})
+                            triage_dept_span.patch()
+                            raise
                         except Exception as e:
                             triage_dept_span.end(error=str(e))
                             triage_dept_span.patch()
@@ -1148,7 +1281,13 @@ class MedicalAgentOrchestrator:
 
                     async def _plan_safety_llm() -> str:
                         try:
-                            txt = await self._agent_reply_full(agents["planner"], plan_safety_prompt)
+                            txt = await self._agent_reply_full(
+                                agents["planner"], plan_safety_prompt, cancel_run_id=cancel_run_id
+                            )
+                        except asyncio.CancelledError:
+                            plan_safety_span.end(error="cancelled", metadata={"cancelled": True})
+                            plan_safety_span.patch()
+                            raise
                         except Exception as e:
                             plan_safety_span.end(error=str(e))
                             plan_safety_span.patch()
@@ -1157,9 +1296,16 @@ class MedicalAgentOrchestrator:
                         plan_safety_span.patch()
                         return txt
 
-                    analyst_text, triage_dept_text, plan_safety_text = await asyncio.gather(
-                        _analyst_llm(), _triage_dept_llm(), _plan_safety_llm()
-                    )
+                    t_analyst = asyncio.create_task(_analyst_llm())
+                    t_td = asyncio.create_task(_triage_dept_llm())
+                    t_ps = asyncio.create_task(_plan_safety_llm())
+                    try:
+                        analyst_text, triage_dept_text, plan_safety_text = await asyncio.gather(t_analyst, t_td, t_ps)
+                    except asyncio.CancelledError:
+                        for t in (t_analyst, t_td, t_ps):
+                            if not t.done():
+                                t.cancel()
+                        raise
                     symptom_analysis = self._safe_json(analyst_text)
                     yield {"type": "agent_step", "content": {"agent": "ConditionAnalyst", "step": "symptom_analysis", "detail": symptom_analysis}}
                     self.conversation_history.append({"agent": "ConditionAnalyst", "message": analyst_text})
@@ -1231,9 +1377,16 @@ class MedicalAgentOrchestrator:
                         },
                     )
                     coord_span.post()
-                    summary_text = await self._agent_reply_full(agents["coordinator"], summary_prompt)
-                    coord_span.end(outputs={"text": summary_text})
-                    coord_span.patch()
+                    try:
+                        summary_text = await self._agent_reply_full(
+                            agents["coordinator"], summary_prompt, cancel_run_id=cancel_run_id
+                        )
+                        coord_span.end(outputs={"text": summary_text})
+                        coord_span.patch()
+                    except asyncio.CancelledError:
+                        coord_span.end(error="cancelled", metadata={"cancelled": True})
+                        coord_span.patch()
+                        raise
                     report["summary"] = (summary_text or "").strip()
                     self._ensure_summary_minimum(report)
 
@@ -1268,6 +1421,10 @@ class MedicalAgentOrchestrator:
                     self._ensure_summary_minimum(report)
                 else:
                     # Fast path: one-shot analysis + triage + plan + safety + summary
+                    if self._agent_cancel_requested(cancel_run_id):
+                        async for _ev in self._agent_abort_stream(run, t0):
+                            yield _ev
+                        return
                     yield _thinking("综合分析与生成结构化报告（加速模式）...")
                     one_shot_prompt = (
                         "你是医疗病历分析专家。请严格输出 JSON（不要 Markdown/解释文字）。\n"
@@ -1369,6 +1526,11 @@ class MedicalAgentOrchestrator:
                         report["summary"] = "病历信息不足，建议补充关键病史与检查结果后再评估（结果仅供参考，不能替代专业医生的诊断与建议）。"
                 except Exception:
                     pass
+
+                if self._agent_cancel_requested(cancel_run_id):
+                    async for _ev in self._agent_abort_stream(run, t0):
+                        yield _ev
+                    return
 
                 yield {"type": "result", "content": report}
                 run.end(

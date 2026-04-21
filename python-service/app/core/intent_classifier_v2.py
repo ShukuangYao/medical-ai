@@ -100,7 +100,7 @@ class HybridIntentClassifier:
             return True
         return False
 
-    async def classify(self, question: str) -> Dict:
+    async def classify(self, question: str, *, cancel_run_id: Optional[str] = None) -> Dict:
         """
         混合意图识别
 
@@ -128,7 +128,7 @@ class HybridIntentClassifier:
 
         # 第二层：LLM分类
         if self.llm:
-            llm_result = await self._llm_classify(question)
+            llm_result = await self._llm_classify(question, cancel_run_id=cancel_run_id)
             self.llm_call_count += 1
             return llm_result
 
@@ -184,23 +184,23 @@ class HybridIntentClassifier:
                     }
         return None
 
-    async def _llm_classify(self, question: str) -> Dict:
+    async def _llm_classify(self, question: str, *, cancel_run_id: Optional[str] = None) -> Dict:
         """LLM分类"""
         try:
             prompt = self.LLM_INTENT_PROMPT.format(question=question)
 
             # 构建消息并指定JSON格式
             messages = [{"role": "user", "content": prompt}]
-            response = await self.llm.client.chat.completions.create(
-                model=self.llm.model,
-                messages=messages,
+            raw = await self.llm.generate(
+                messages,
                 temperature=0.1,
                 max_tokens=200,
-                response_format={"type": "json_object"}
+                cancel_run_id=cancel_run_id,
+                response_format={"type": "json_object"},
             )
 
-            # 解析JSON
-            result = json.loads(response.choices[0].message.content)
+            # 解析JSON（部分供应商会额外包裹文本，尽量稳健）
+            result = json.loads((raw or "").strip() or "{}")
 
             intent = result.get("intent", "general_medical")
             entity = result.get("entity")

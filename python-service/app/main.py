@@ -10,7 +10,7 @@ if not os.getenv("LANGSMITH_TRACING_V2"):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from langsmith.middleware import TracingMiddleware
-from app.routers import rag, agent, sessions
+from app.routers import rag, agent, sessions, cancel
 
 app = FastAPI(title="医疗AI辅助诊断系统 - Python服务")
 
@@ -30,6 +30,7 @@ app.add_middleware(TracingMiddleware)
 app.include_router(rag.router, prefix="/api", tags=["RAG"])
 app.include_router(agent.router, prefix="/api", tags=["Agent"])
 app.include_router(sessions.router, prefix="/api", tags=["Sessions"])
+app.include_router(cancel.router, prefix="/api", tags=["Cancel"])
 
 @app.get("/")
 async def root():

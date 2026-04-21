@@ -37,6 +37,7 @@ from app.core.tools.base import ToolContext, ToolError
 from app.core.tools.executor import ToolExecutor
 from app.core.tools.registry import ToolRegistry
 from app.core.tools.impl import GraphQueryTool, HybridRetrieveTool, RerankTool, RewriteQuestionTool
+from app.core.run_cancel import is_cancelled as run_cancelled
 
 from langsmith import RunTree
 from langsmith.run_helpers import get_current_run_tree, tracing_context
@@ -250,6 +251,7 @@ class LocalDocQA:
         emit_thinking: bool,
         emit_intent: bool,
         persist: bool,
+        cancel_run_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict, None]:
         """共享的 RAG 内部实现：用事件流表达完整流程。
 
@@ -329,8 +331,9 @@ class LocalDocQA:
                     if self.memory_manager:
                         if not chat_history and user_id:
                             try:
-                                history = self.memory_manager.short_term.get_history(session_id, limit=2)
-                                chat_history = [{"role": h["role"], "content": h["content"]} for h in history[-4:]]
+                                # Keep 3 turns (user+assistant)*3 = 6 messages for better follow-up resolution.
+                                history = self.memory_manager.short_term.get_history(session_id, limit=3)
+                                chat_history = [{"role": h["role"], "content": h["content"]} for h in history[-6:]]
                             except Exception as e:
                                 print(f"获取短期记忆失败: {e}")
                                 chat_history = []
@@ -401,7 +404,28 @@ class LocalDocQA:
                     inputs={"question": question},
                 )
                 intent_span.post()
-                intent_result = await self.intent_classifier.classify(question)
+                intent_result = await self.intent_classifier.classify(question, cancel_run_id=cancel_run_id)
+                # Heuristic: follow-up questions like "那应该怎么办" are often medical in context.
+                # If the classifier returns out_of_scope but recent history looks medical,
+                # override to general_medical to avoid false refusal.
+                try:
+                    q_norm = (question or "").strip()
+                    followup_phrases = ("那应该怎么办", "那怎么办", "怎么办", "然后呢", "接下来呢", "怎么处理", "怎么做", "该怎么做", "该咋办", "要怎么做")
+                    is_followup = (len(q_norm) <= 12) and any(p in q_norm for p in followup_phrases)
+                    if is_followup and str(intent_result.get("intent") or "") == "out_of_scope":
+                        hist_text = "\n".join([str(m.get("content") or "") for m in (chat_history or [])][-8:])
+                        medical_markers = ("科", "挂号", "医院", "就诊", "症状", "疼", "痛", "发烧", "咳", "药", "用药", "检查", "诊断", "治疗", "感染")
+                        if any(k in hist_text for k in medical_markers):
+                            intent_result["intent"] = "general_medical"
+                            intent_result["use_graph"] = False
+                            intent_result["method"] = "heuristic_followup"
+                            try:
+                                c = float(intent_result.get("confidence", 0.0))
+                            except Exception:
+                                c = 0.0
+                            intent_result["confidence"] = max(0.55, c)
+                except Exception:
+                    pass
                 intent_span.end(
                     outputs={**intent_result, "duration_ms": perf_ms_since(intent_t0)},
                     metadata={"duration_ms": perf_ms_since(intent_t0)},
@@ -435,7 +459,18 @@ class LocalDocQA:
                         "type": "thinking",
                         "content": f"✓ 识别意图: {intent_desc} (置信度: {intent_result['confidence']:.0%})",
                     }
-                    thinking_steps.append(f"✓ 识别意图: {intent_desc} (置信度: {intent_result['confidence']:.0%})")
+                thinking_steps.append(f"✓ 识别意图: {intent_desc} (置信度: {intent_result['confidence']:.0%})")
+
+                if cancel_run_id and run_cancelled(cancel_run_id):
+                    run.end(
+                        outputs={"cancelled": True, "duration_ms": perf_ms_since(run_t0)},
+                        metadata={"cancelled": True},
+                    )
+                    run.patch()
+                    if emit_thinking:
+                        yield _thinking("— 已取消（服务器已停止后续处理）")
+                    yield {"type": "done", "content": ""}
+                    return
 
                 # 步骤1.5：问题改写
                 if intent_result["intent"] not in ["greeting", "thanks", "out_of_scope"]:
@@ -488,6 +523,17 @@ class LocalDocQA:
                         yield _thinking("🔍 正在查询知识图谱...")
                     else:
                         yield _thinking("🔍 正在检索相关文档...")
+
+                if cancel_run_id and run_cancelled(cancel_run_id):
+                    run.end(
+                        outputs={"cancelled": True, "duration_ms": perf_ms_since(run_t0)},
+                        metadata={"cancelled": True},
+                    )
+                    run.patch()
+                    if emit_thinking:
+                        yield _thinking("— 已取消（服务器已停止检索）")
+                    yield {"type": "done", "content": ""}
+                    return
 
                 _route_start, route_t0 = span_times()
                 try:
@@ -568,14 +614,64 @@ class LocalDocQA:
                     },
                 )
                 llm_span.post()
-                async for token in stream_llm.generate_stream(messages):
-                    if first_token:
-                        first_token = False
-                        first_token_seen_at = time.perf_counter()
+                try:
+                    async for token in stream_llm.generate_stream(messages, cancel_run_id=cancel_run_id):
+                        if cancel_run_id and run_cancelled(cancel_run_id):
+                            llm_span.end(
+                                outputs={
+                                    "cancelled": True,
+                                    "output_chars": len(full_answer),
+                                    "duration_ms": perf_ms_since(llm_t0),
+                                },
+                                metadata={"cancelled": True},
+                            )
+                            llm_span.patch()
+                            run.end(
+                                outputs={
+                                    "answer": full_answer,
+                                    "cancelled": True,
+                                    "duration_ms": perf_ms_since(run_t0),
+                                },
+                                metadata={"cancelled": True},
+                            )
+                            run.patch()
+                            if emit_thinking:
+                                yield _thinking("— 已取消（服务器已停止后续生成）")
+                            yield {"type": "done", "content": ""}
+                            return
+                        if first_token:
+                            first_token = False
+                            first_token_seen_at = time.perf_counter()
+                            if emit_thinking:
+                                yield _thinking("⏱️ 首 token 已返回")
+                        full_answer += token
+                        yield {"type": "token", "content": token}
+                except asyncio.CancelledError:
+                    # If llm_client observed a cooperative cancel and raised, treat it as a clean stop.
+                    if cancel_run_id and run_cancelled(cancel_run_id):
+                        llm_span.end(
+                            outputs={
+                                "cancelled": True,
+                                "output_chars": len(full_answer),
+                                "duration_ms": perf_ms_since(llm_t0),
+                            },
+                            metadata={"cancelled": True},
+                        )
+                        llm_span.patch()
+                        run.end(
+                            outputs={
+                                "answer": full_answer,
+                                "cancelled": True,
+                                "duration_ms": perf_ms_since(run_t0),
+                            },
+                            metadata={"cancelled": True},
+                        )
+                        run.patch()
                         if emit_thinking:
-                            yield _thinking("⏱️ 首 token 已返回")
-                    full_answer += token
-                    yield {"type": "token", "content": token}
+                            yield _thinking("— 已取消（服务器已停止后续生成）")
+                        yield {"type": "done", "content": ""}
+                        return
+                    raise
 
                 # Some providers/models (e.g. DeepSeek reasoner) may stream only reasoning fields and leave
                 # user-visible content empty. If we ended up with an empty answer, fall back to a single
@@ -596,6 +692,7 @@ class LocalDocQA:
                             messages,
                             temperature=0.7,
                             max_tokens=settings.MAX_OUTPUT_TOKENS,
+                            cancel_run_id=cancel_run_id,
                         )
                         full_answer = (fallback_text or "").strip()
                         if full_answer:
@@ -727,6 +824,7 @@ class LocalDocQA:
             emit_thinking=False,
             emit_intent=False,
             persist=False,
+            cancel_run_id=None,
         ):
             if evt.get("type") == "token":
                 answer_parts.append(evt.get("content") or "")
@@ -744,6 +842,7 @@ class LocalDocQA:
         user_id: Optional[str] = None,
         model_provider: Optional[str] = None,
         model_name: Optional[str] = None,
+        cancel_run_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict, None]:
         """
         完整RAG查询流程（流式输出，集成意图路由和记忆）
@@ -766,5 +865,6 @@ class LocalDocQA:
             emit_thinking=True,
             emit_intent=True,
             persist=True,
+            cancel_run_id=cancel_run_id,
         ):
             yield evt

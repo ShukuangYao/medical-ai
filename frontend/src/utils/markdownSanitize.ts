@@ -100,9 +100,16 @@ export function sanitizeDisplayText(
   // Examples that should all become 【参考4】:
   // - [参考4] / ［参考4］ / (参考4) / （参考4）
   // - [[参考4]] / 【【参考4】】 / 【[参考4] / [参考4】 / 【参考4]
+  // Pass 1: safe-ish normalization when a non-letter/number boundary exists (avoids matching inside English words).
   s = s.replace(
     /(^|[^\p{Letter}\p{Number}])(?:[【\[\(（［]\s*){1,4}参考\s*([0-9]+)\s*(?:[】\]\)）］]\s*){0,4}/gmu,
     (_m, prefix, n) => `${prefix}【参考${n}】`
+  )
+  // Pass 2: CJK-heavy outputs often attach markers right after a Chinese character (which counts as \p{Letter}),
+  // e.g. "有关。【【参考3】】" or "有关[参考3]" with no space. Normalize those too.
+  s = s.replace(
+    /(?:[【\[\(（［]\s*){1,4}参考\s*([0-9]+)\s*(?:[】\]\)）］]\s*){0,4}/gmu,
+    (_m, n) => `【参考${n}】`
   )
   // If brackets were already dropped (e.g. rendered as plain "参考 4"), normalize that too.
   s = s.replace(

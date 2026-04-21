@@ -129,6 +129,10 @@ class Settings:
     MAX_CONTEXT_TOKENS = 3000  # 上下文最大Token数
     # 生成最大 Token 数（越大越不易截断，但延迟/费用更高；不同 provider 也可能有自身上限）
     MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1200"))
+
+    # LLM HTTP 429 / 5xx 退避重试（OpenAI 兼容 SDK，见 llm_client）
+    LLM_HTTP_MAX_RETRIES = int(os.getenv("LLM_HTTP_MAX_RETRIES", "3"))
+    LLM_HTTP_RETRY_BASE_MS = int(os.getenv("LLM_HTTP_RETRY_BASE_MS", "400"))
     MAX_HISTORY_TOKENS = int(os.getenv("MAX_HISTORY_TOKENS", "800"))  # 历史对话窗口最大Token数（估算）
 
     # 文档切片配置

@@ -19,11 +19,14 @@ function ChatBox({ mode }: ChatBoxProps) {
   const [graphMode, setGraphMode] = useState(true)
   /** Agent: full restores legacy multi-step agents (richer but slower). */
   const [agentDetailMode, setAgentDetailMode] = useState(false)
+  const [stopping, setStopping] = useState(false)
   const streamContentRef = useRef('')
   const tokenQueueRef = useRef<string[]>([])
   const typewriterTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const isDoneRef = useRef(false)
   const abortControllerRef = useRef<AbortController | null>(null)
+  /** Node `run_id` from first SSE envelope; POST /api/cancel before abort. */
+  const currentRunIdRef = useRef<string>('')
   /** 记录本次请求的 mode，用于跨 tab 场景下回调仍写入正确 tab */
   const requestModeRef = useRef<ChatMode>(mode)
   /** 记录本次请求的 sessionId，确保回调写入正确会话 */
@@ -152,14 +155,43 @@ function ChatBox({ mode }: ChatBoxProps) {
     }, 20)
   }, [])
 
-  // 用户点击停止：中断 SSE + flush 打字机队列
-  const handleStop = useCallback(() => {
-    abortControllerRef.current?.abort()
-    abortControllerRef.current = null
-    stopTypewriter(true)
-    useChatStore.getState().updateMessageById(assistantMsgIdRef.current, (msg) => ({ ...msg, thinkingExpanded: false }))
-    setLoadingForMode(requestModeRef.current, false)
-  }, [stopTypewriter, setLoadingForMode])
+  // 用户点击停止：先等取消到达 Python，再断 SSE；快照 ref 避免 await 期间新请求覆盖
+  const handleStop = useCallback(async () => {
+    if (stopping) return
+    setStopping(true)
+    const rid = currentRunIdRef.current.trim()
+    const ctrl = abortControllerRef.current
+    const modeAtStop = requestModeRef.current
+    const aid = assistantMsgIdRef.current
+
+    try {
+      if (rid) {
+        try {
+          await fetch('/api/cancel', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ run_id: rid }),
+            signal: AbortSignal.timeout(150_000),
+          })
+        } catch {
+          // 网络错误 / 150s 超时：仍断开客户端流，避免挂死
+        }
+      }
+
+      if (currentRunIdRef.current === rid) {
+        currentRunIdRef.current = ''
+      }
+      ctrl?.abort()
+      if (abortControllerRef.current === ctrl) {
+        abortControllerRef.current = null
+      }
+      stopTypewriter(true)
+      useChatStore.getState().updateMessageById(aid, (msg) => ({ ...msg, thinkingExpanded: false }))
+      setLoadingForMode(modeAtStop, false)
+    } finally {
+      setStopping(false)
+    }
+  }, [stopTypewriter, setLoadingForMode, stopping])
 
   const handleSend = async () => {
     if (!inputValue.trim() || loading) return
@@ -189,6 +221,8 @@ function ChatBox({ mode }: ChatBoxProps) {
     const agentPipeline: AgentPipeline | undefined = m === 'agent' ? (agentDetailMode ? 'full' : 'fast') : undefined
 
     if (streamMode) {
+      setStopping(false)
+      currentRunIdRef.current = ''
       streamContentRef.current = ''
       tokenQueueRef.current = []
       isDoneRef.current = false
@@ -242,6 +276,9 @@ function ChatBox({ mode }: ChatBoxProps) {
               ...msg, thinkingSteps: [...(msg.thinkingSteps ?? []), ...steps],
             }))
           },
+          onRunId: (runId) => {
+            if (runId.trim()) currentRunIdRef.current = runId.trim()
+          },
           onSession: (id) => {
             requestSessionIdRef.current = id
             useChatStore.getState().setSessionIdForMode(requestModeRef.current, id)
@@ -256,6 +293,8 @@ function ChatBox({ mode }: ChatBoxProps) {
             }))
           },
           onDone: () => {
+            currentRunIdRef.current = ''
+            setStopping(false)
             isDoneRef.current = true
             const queueEmpty = tokenQueueRef.current.length === 0
             updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, aid, (msg) => ({
@@ -272,6 +311,8 @@ function ChatBox({ mode }: ChatBoxProps) {
             startTypewriter()
           },
           onError: (error) => {
+            currentRunIdRef.current = ''
+            setStopping(false)
             stopTypewriter(true)
             message.error(`生成错误: ${error}`)
             updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, assistantMsgIdRef.current, (msg) => ({ ...msg, thinkingExpanded: false, streaming: false }))
@@ -396,8 +437,15 @@ function ChatBox({ mode }: ChatBoxProps) {
           disabled={loading}
         />
         {loading && streamMode ? (
-          <Button danger icon={<StopOutlined />} onClick={handleStop} style={{ height: 'auto' }}>
-            停止
+          <Button
+            danger
+            icon={<StopOutlined />}
+            onClick={handleStop}
+            loading={stopping}
+            disabled={stopping}
+            style={{ height: 'auto' }}
+          >
+            {stopping ? '正在停止…' : '停止'}
           </Button>
         ) : (
           <Button

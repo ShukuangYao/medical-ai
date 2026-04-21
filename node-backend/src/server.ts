@@ -13,6 +13,7 @@ import cors from '@fastify/cors'
 import multipart from '@fastify/multipart'
 import { config } from './config.js'
 import chatRoutes from './routes/chat.js'
+import cancelRoutes from './routes/cancel.js'
 import configRoutes from './routes/config.js'
 import healthRoutes from './routes/health.js'
 import sessionRoutes from './routes/sessions.js'
@@ -30,6 +31,7 @@ await fastify.register(multipart)
 
 // 注册路由
 await fastify.register(chatRoutes, { prefix: '/api' })
+await fastify.register(cancelRoutes, { prefix: '/api' })
 await fastify.register(sessionRoutes, { prefix: '/api' })
 await fastify.register(configRoutes, { prefix: '/api' })
 await fastify.register(healthRoutes)

@@ -1,18 +1,54 @@
 """LLM客户端 - OpenAI兼容接口（Qwen/DashScope, DeepSeek 等）"""
 from __future__ import annotations
 
+import asyncio
+import random
 import time
-from typing import AsyncGenerator, List, Dict, Optional, Literal
+from typing import Any, AsyncGenerator, Dict, List, Literal, Optional
 from datetime import datetime, timezone
 from openai import AsyncOpenAI
 from app.config import settings
 from app.core.context_builder import ContextBuilder
 from app.core.ls_timing import now_utc, perf_ms_since, span_times
+from app.core.run_cancel import is_cancelled as run_cancelled
 
 from langsmith.run_helpers import get_current_run_tree
 
 _LANGSMITH_BUILD_ID = "ls-timing-fix-2026-04-14"
 _LANGSMITH_SPAN_SUFFIX = f"@{_LANGSMITH_BUILD_ID}"
+
+
+def _is_retryable_llm_http_error(exc: BaseException) -> bool:
+    """429 / 5xx from OpenAI-compatible providers."""
+    try:
+        from openai import APIStatusError
+
+        if isinstance(exc, APIStatusError):
+            c = int(exc.status_code)
+            return c == 429 or (500 <= c < 600)
+    except Exception:
+        pass
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        return False
+    try:
+        c = int(status)
+        return c == 429 or (500 <= c < 600)
+    except (TypeError, ValueError):
+        return False
+
+
+async def _llm_http_backoff(attempt: int) -> None:
+    base_s = float(getattr(settings, "LLM_HTTP_RETRY_BASE_MS", 400)) / 1000.0
+    delay = min(30.0, base_s * (2**attempt) + random.uniform(0, base_s))
+    await asyncio.sleep(delay)
+
+def _cancel_requested(cancel_run_id: Optional[str]) -> bool:
+    return bool(cancel_run_id) and run_cancelled(cancel_run_id)
+
+
+class LLMRunCancelled(asyncio.CancelledError):
+    """Raised when a cooperative cancel flag is observed inside llm_client."""
 
 
 class OpenAILLM:
@@ -65,6 +101,8 @@ class OpenAILLM:
         temperature: float = 0.7,
         max_tokens: int = None,
         model: Optional[str] = None,
+        cancel_run_id: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> str:
         """非流式生成回答"""
         m = model or self.model
@@ -86,13 +124,43 @@ class OpenAILLM:
             t0_span = time.perf_counter()
 
         t0 = time.perf_counter()
+        max_retries = int(getattr(settings, "LLM_HTTP_MAX_RETRIES", 3))
+        attempt_used = 0
+        response = None
+        last_exc: Optional[BaseException] = None
         try:
-            response = await self.client.chat.completions.create(
-                model=m,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_out,
-            )
+            for attempt in range(max_retries + 1):
+                attempt_used = attempt
+                if _cancel_requested(cancel_run_id):
+                    raise LLMRunCancelled("cancelled")
+                try:
+                    response = await self.client.chat.completions.create(
+                        model=m,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_out,
+                        response_format=response_format,
+                    )
+                    break
+                except Exception as e:
+                    last_exc = e
+                    if not _is_retryable_llm_http_error(e) or attempt >= max_retries:
+                        if span is not None:
+                            span.end(
+                                error=str(e),
+                                metadata={
+                                    "duration_ms": perf_ms_since(t0_span),
+                                    "build_id": _LANGSMITH_BUILD_ID,
+                                    "llm_http_retries": attempt,
+                                },
+                            )
+                            span.patch()
+                        raise
+                    if _cancel_requested(cancel_run_id):
+                        raise LLMRunCancelled("cancelled")
+                    await _llm_http_backoff(attempt)
+            if response is None:
+                raise last_exc if last_exc else RuntimeError("LLM chat.completions failed")
             text = response.choices[0].message.content or ""
             if span is not None:
                 span.end(
@@ -101,19 +169,35 @@ class OpenAILLM:
                         "elapsed_ms": int((time.perf_counter() - t0) * 1000),
                         "duration_ms": perf_ms_since(t0_span),
                         "build_id": _LANGSMITH_BUILD_ID,
-                    }
-                    ,
+                        "llm_http_retries": attempt_used,
+                    },
                     metadata={"duration_ms": perf_ms_since(t0_span), "build_id": _LANGSMITH_BUILD_ID},
                 )
                 span.patch()
             return text
-        except Exception as e:
+        except LLMRunCancelled as e:
             if span is not None:
                 span.end(
-                    error=str(e),
-                    metadata={"duration_ms": perf_ms_since(t0_span), "build_id": _LANGSMITH_BUILD_ID},
+                    error="cancelled",
+                    metadata={"cancelled": True, "duration_ms": perf_ms_since(t0_span), "build_id": _LANGSMITH_BUILD_ID},
                 )
                 span.patch()
+            raise e
+        except asyncio.CancelledError as e:
+            # Task was cancelled (e.g. upstream timeout / gather cancellation). Treat as cancelled for tracing.
+            if span is not None:
+                span.end(
+                    error="cancelled",
+                    metadata={
+                        "cancelled": True,
+                        "duration_ms": perf_ms_since(t0_span),
+                        "build_id": _LANGSMITH_BUILD_ID,
+                        "llm_http_retries": attempt_used,
+                    },
+                )
+                span.patch()
+            raise e
+        except Exception:
             raise
 
     async def generate_stream(
@@ -123,6 +207,7 @@ class OpenAILLM:
         max_tokens: int = None,
         model: Optional[str] = None,
         include_reasoning: bool = False,
+        cancel_run_id: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """流式生成回答，逐token返回"""
         m = model or self.model
@@ -147,15 +232,65 @@ class OpenAILLM:
         t0 = time.perf_counter()
         out = ""
         first_token_at: Optional[float] = None
+        max_retries = int(getattr(settings, "LLM_HTTP_MAX_RETRIES", 3))
+        attempt_used = 0
+        response = None
+        last_exc: Optional[BaseException] = None
         try:
-            response = await self.client.chat.completions.create(
-                model=m,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_out,
-                stream=True,
-            )
-            async for chunk in response:
+            for attempt in range(max_retries + 1):
+                attempt_used = attempt
+                if _cancel_requested(cancel_run_id):
+                    raise LLMRunCancelled("cancelled")
+                try:
+                    response = await self.client.chat.completions.create(
+                        model=m,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_out,
+                        stream=True,
+                    )
+                    break
+                except Exception as e:
+                    last_exc = e
+                    if not _is_retryable_llm_http_error(e) or attempt >= max_retries:
+                        if span is not None:
+                            span.end(
+                                error=str(e),
+                                metadata={
+                                    "duration_ms": perf_ms_since(t0_span),
+                                    "build_id": _LANGSMITH_BUILD_ID,
+                                    "llm_http_retries": attempt,
+                                },
+                            )
+                            span.patch()
+                        raise
+                    if _cancel_requested(cancel_run_id):
+                        raise LLMRunCancelled("cancelled")
+                    await _llm_http_backoff(attempt)
+            if response is None:
+                raise last_exc if last_exc else RuntimeError("LLM stream create failed")
+            # Some providers block waiting for the next SSE chunk; poll cancellation periodically
+            # so stop feels immediate even when no new tokens arrive.
+            aiter = response.__aiter__() if hasattr(response, "__aiter__") else response
+            while True:
+                if _cancel_requested(cancel_run_id):
+                    try:
+                        aclose = getattr(response, "aclose", None)
+                        if callable(aclose):
+                            await aclose()
+                        else:
+                            close = getattr(response, "close", None)
+                            if callable(close):
+                                close()
+                    except Exception:
+                        pass
+                    raise LLMRunCancelled("cancelled")
+                try:
+                    chunk = await asyncio.wait_for(aiter.__anext__(), timeout=0.5)  # type: ignore[attr-defined]
+                except asyncio.TimeoutError:
+                    continue
+                except StopAsyncIteration:
+                    break
                 if not chunk.choices:
                     continue
                 delta = getattr(chunk.choices[0], "delta", None)
@@ -192,11 +327,49 @@ class OpenAILLM:
                         ),
                         "duration_ms": perf_ms_since(t0_span),
                         "build_id": _LANGSMITH_BUILD_ID,
-                    }
-                    ,
+                        "llm_http_retries": attempt_used,
+                    },
                     metadata={"duration_ms": perf_ms_since(t0_span), "build_id": _LANGSMITH_BUILD_ID},
                 )
                 span.patch()
+        except LLMRunCancelled as e:
+            if span is not None:
+                span.end(
+                    error="cancelled",
+                    metadata={
+                        "cancelled": True,
+                        "duration_ms": perf_ms_since(t0_span),
+                        "build_id": _LANGSMITH_BUILD_ID,
+                        "llm_http_retries": attempt_used,
+                    },
+                )
+                span.patch()
+            raise e
+        except asyncio.CancelledError as e:
+            # If we are cancelled while awaiting/iterating, best-effort close the upstream stream and end span.
+            try:
+                if response is not None:
+                    aclose = getattr(response, "aclose", None)
+                    if callable(aclose):
+                        await aclose()
+                    else:
+                        close = getattr(response, "close", None)
+                        if callable(close):
+                            close()
+            except Exception:
+                pass
+            if span is not None:
+                span.end(
+                    error="cancelled",
+                    metadata={
+                        "cancelled": True,
+                        "duration_ms": perf_ms_since(t0_span),
+                        "build_id": _LANGSMITH_BUILD_ID,
+                        "llm_http_retries": attempt_used,
+                    },
+                )
+                span.patch()
+            raise e
         except Exception as e:
             if span is not None:
                 span.end(

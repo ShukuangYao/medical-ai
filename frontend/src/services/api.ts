@@ -16,6 +16,8 @@ export interface StreamCallbacks {
   onAgentStep?: (step: unknown) => void
   onResult?: (report: AgentReport) => void
   onSession?: (sessionId: string) => void
+  /** Same id as X-Run-Id; call POST /api/cancel before aborting the stream for server-side stop. */
+  onRunId?: (runId: string) => void
   onDone: () => void
   onError: (error: string) => void
   onRetry?: (attempt: number, delayMs: number) => void
@@ -62,6 +64,7 @@ export const chatAPI = {
       },
       callbacks: {
         onToken: callbacks.onToken,
+        onRunId: callbacks.onRunId,
         onDone: callbacks.onDone,
         onError: callbacks.onError,
         onRetry: callbacks.onRetry,

@@ -4,6 +4,7 @@ import { postPythonBuffer, postPythonStream } from '../pythonUpstream.js'
 import type { ChatResponse } from '../types/index.js'
 import { v4 as uuidv4 } from 'uuid'
 import { getCurrentRunTree, traceable } from 'langsmith/traceable'
+import { consumeCancelled } from '../cancelRegistry.js'
 
 /** LangSmith only: avoid logging huge `report` / long strings (does not change HTTP response). */
 function sanitizeNodeChatTraceOutputs(outputs: Readonly<ChatResponse>): Record<string, unknown> {
@@ -65,6 +66,7 @@ export default async function chatRoutes(fastify: FastifyInstance) {
     const runId: string = String(request.headers?.['x-run-id'] || '') || uuidv4()
     const handler = traceable(
       async () => {
+      try {
       // Surface IDs to the browser for debugging/correlation (request headers are client-owned).
       // Note: these are response headers for the browser -> node hop.
       try {
@@ -172,6 +174,17 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       }
 
       return chatResponse
+      } finally {
+        const cancelled = consumeCancelled(runId)
+        if (cancelled) {
+          try {
+            const rt = getCurrentRunTree() as any
+            if (rt) rt.metadata = { cancelled: true }
+          } catch {
+            // ignore metadata update errors
+          }
+        }
+      }
       },
       {
         name: buildLangsmithRunName({
@@ -301,6 +314,19 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       // 先发送sessionId
       reply.raw.write(`data: ${JSON.stringify({ type: 'session', content: sessionId, request_id: requestId, run_id: runId })}\n\n`)
 
+      // If the browser aborts the SSE connection without calling /api/cancel,
+      // best-effort stop piping Python upstream and mark the node run as cancelled.
+      let clientAborted = false
+      const onClose = () => {
+        clientAborted = true
+        try {
+          incoming.destroy(new Error('client_disconnected'))
+        } catch {
+          // ignore
+        }
+      }
+      reply.raw.once('close', onClose)
+
       await new Promise<void>((resolve, reject) => {
         incoming.on('data', (chunk: Buffer) => {
           reply.raw.write(chunk)
@@ -310,9 +336,20 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       })
 
       reply.raw.end()
+      const cancelled = clientAborted || consumeCancelled(runId)
+      try {
+        const rt = getCurrentRunTree() as any
+        if (cancelled && rt) rt.metadata = { cancelled: true }
+      } catch {
+        // ignore metadata update errors
+      }
+      if (cancelled) {
+        // Mark the node root run as cancelled (shows up in LangSmith "Error" column).
+        throw new Error(clientAborted ? 'client_disconnected' : 'cancelled')
+      }
       // IMPORTANT: this route streams the response; do not return a JSON body,
       // otherwise Fastify will attempt to send a second response.
-      return null
+      return { cancelled }
       },
       {
         name: buildLangsmithRunName({
@@ -357,9 +394,20 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       await handler()
       return reply
     } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      if (msg === 'cancelled' || msg === 'client_disconnected') {
+        // Expected: user clicked Stop or browser aborted the SSE connection.
+        // Traceable run has been marked cancelled; do not write an SSE error event.
+        try {
+          if (!reply.raw.writableEnded) reply.raw.end()
+        } catch {
+          // ignore
+        }
+        return reply
+      }
       fastify.log.error(error)
       if (!reply.raw.headersSent) {
-        const detail = error instanceof Error ? error.message : String(error)
+        const detail = msg
         reply.status(500).send({
           error: 'chat_stream_failed',
           detail: detail.slice(0, 4000),

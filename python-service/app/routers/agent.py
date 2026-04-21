@@ -1,4 +1,5 @@
 import asyncio
+import json
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from app.models import ChatRequest, ChatResponse, TraceItem, Source
@@ -7,6 +8,7 @@ from datetime import datetime, timezone
 
 from app.core.singletons import get_agent_orchestrator
 from app.core.sse_envelope import sse_context_from_request, sse_envelope, sse_data_line
+from app.core.run_cancel import clear_run
 
 from langsmith import RunTree
 from langsmith.run_helpers import get_current_run_tree, tracing_context
@@ -52,6 +54,7 @@ async def agent_diagnose_stream(http_request: Request, request: ChatRequest):
 
     async def generate():
         ended = False
+        rid = (sse_ctx.run_id or "").strip()
         try:
             last_report = None
             with tracing_context(parent=root):
@@ -63,6 +66,7 @@ async def agent_diagnose_stream(http_request: Request, request: ChatRequest):
                     model_name=request.model_name,
                     user_id=uid,
                     agent_pipeline=request.agent_pipeline or "fast",
+                    cancel_run_id=rid or None,
                 ):
                     if chunk.get("type") == "result":
                         last_report = chunk.get("content")
@@ -77,7 +81,7 @@ async def agent_diagnose_stream(http_request: Request, request: ChatRequest):
         except asyncio.CancelledError:
             try:
                 if not ended:
-                    root.end(error="cancelled", end_time=datetime.now(timezone.utc))
+                    root.end(error="cancelled", metadata={"cancelled": True}, end_time=datetime.now(timezone.utc))
                     root.patch()
             finally:
                 raise
@@ -91,6 +95,8 @@ async def agent_diagnose_stream(http_request: Request, request: ChatRequest):
             err_evt = sse_envelope({"type": "error", "content": str(e)}, ctx=sse_ctx, mutate=False)
             yield sse_data_line(err_evt)
         finally:
+            if rid:
+                clear_run(rid)
             if not ended:
                 try:
                     root.end(
@@ -144,6 +150,7 @@ async def agent_diagnose(http_request: Request, request: ChatRequest):
                 model_name=request.model_name,
                 user_id=uid,
                 agent_pipeline=request.agent_pipeline or "fast",
+                cancel_run_id=None,
             ):
                 ct = chunk.get("type")
                 if ct == "agent_step":

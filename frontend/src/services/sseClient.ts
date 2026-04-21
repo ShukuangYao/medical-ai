@@ -12,6 +12,8 @@ export interface SSECallbacks {
   onDone: () => void
   onError: (err: string) => void
   onRetry?: (attempt: number, delayMs: number) => void
+  /** Present on envelopes from Node/Python (e.g. session line); used for POST /api/cancel. */
+  onRunId?: (runId: string) => void
 }
 
 export interface SSEOptions {
@@ -65,17 +67,19 @@ export function createSSEConnection(options: SSEOptions): AbortController {
           } else if (line.startsWith('data: ')) {
             // Token 级别异常隔离：单条解析失败不影响后续
             try {
-              const data = JSON.parse(line.slice(6))
+              const data = JSON.parse(line.slice(6)) as Record<string, unknown>
+              const rid = typeof data.run_id === 'string' ? data.run_id.trim() : ''
+              if (rid) options.callbacks.onRunId?.(rid)
               if (data.type === 'token') {
-                options.callbacks.onToken(data.content ?? '')
+                options.callbacks.onToken(String(data.content ?? ''))
               } else if (data.type === 'done') {
                 options.callbacks.onDone()
                 return
               } else if (data.type === 'error') {
-                options.callbacks.onError(data.content ?? '未知错误')
+                options.callbacks.onError(String(data.content ?? '未知错误'))
                 return
               } else {
-                options.callbacks.onEvent(data.type, data.content)
+                options.callbacks.onEvent(String(data.type), data.content)
               }
             } catch {
               // 忽略单条 JSON 解析错误，继续处理后续 token
