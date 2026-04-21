@@ -32,6 +32,32 @@ function sanitizeNodeChatTraceOutputs(outputs: Readonly<ChatResponse>): Record<s
 
 export default async function chatRoutes(fastify: FastifyInstance) {
   const DEFAULT_USER_ID = 'anonymous'
+
+  const buildLangsmithRunName = (args: {
+    endpoint: string
+    mode: string
+    stream: boolean
+    modelProvider?: string
+    modelName?: string
+    agentPipeline?: string
+  }) => {
+    const mode = (args.mode || 'rag').trim() || 'rag'
+    const stream = args.stream ? 'stream' : 'buffer'
+    const mp = (args.modelProvider || '').trim()
+    const mn = (args.modelName || '').trim()
+    const ap = (args.agentPipeline || '').trim()
+    const modelPart =
+      mode === 'rag' && (mp || mn)
+        ? `${mp ? mp : 'model'}:${mn ? mn : 'default'}`
+        : mode === 'agent' && ap
+          ? `agent:${ap}`
+          : mode === 'agent'
+            ? 'agent'
+            : 'rag'
+    // Keep it readable in LangSmith tables, but still grep-friendly.
+    return `node_chat:${args.endpoint}:${mode}:${stream}:${modelPart}`
+  }
+
   // 非流式聊天接口
   fastify.post('/chat', async (request: any, reply: any) => {
     const bodyForMeta = (request.body as any) || {}
@@ -113,6 +139,10 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       const ap = (agentPipeline || '').trim().toLowerCase()
       const agent_pipeline = mode === 'agent' && (ap === 'full' || ap === 'fast') ? ap : undefined
 
+      // Agent mode does NOT allow client-side model selection: server uses per-agent config/env.
+      const effectiveModelProvider = mode === 'rag' ? (modelProvider || undefined) : undefined
+      const effectiveModelName = mode === 'rag' ? (modelName || undefined) : undefined
+
       const { status: pyStatus, body: pyBody } = await postPythonBuffer(
         pythonEndpoint,
         {
@@ -120,8 +150,8 @@ export default async function chatRoutes(fastify: FastifyInstance) {
           user_id: effectiveUserId,
           message,
           question: message,
-          model_provider: modelProvider || undefined,
-          model_name: modelName || undefined,
+          model_provider: effectiveModelProvider,
+          model_name: effectiveModelName,
           ...(agent_pipeline ? { agent_pipeline } : {}),
         },
         { ...lsHeaders, ...requestHeaders },
@@ -144,9 +174,30 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       return chatResponse
       },
       {
-        name: 'node_chat',
+        name: buildLangsmithRunName({
+          endpoint: '/api/chat',
+          mode: String(bodyForMeta?.mode || 'rag'),
+          stream: false,
+          modelProvider: String(bodyForMeta?.modelProvider || ''),
+          modelName: String(bodyForMeta?.modelName || ''),
+          agentPipeline: String(bodyForMeta?.agentPipeline || ''),
+        }),
         run_type: 'chain',
-        tags: ['service:node', 'endpoint:/api/chat'],
+        tags: [
+          'service:node',
+          'endpoint:/api/chat',
+          `mode:${String(bodyForMeta?.mode || 'rag')}`,
+          `stream:false`,
+          ...(String(bodyForMeta?.modelProvider || '').trim()
+            ? [`model_provider:${String(bodyForMeta.modelProvider).trim()}`]
+            : []),
+          ...(String(bodyForMeta?.modelName || '').trim()
+            ? [`model_name:${String(bodyForMeta.modelName).trim()}`]
+            : []),
+          ...(String(bodyForMeta?.agentPipeline || '').trim()
+            ? [`agent_pipeline:${String(bodyForMeta.agentPipeline).trim().toLowerCase()}`]
+            : []),
+        ],
         metadata: {
           mode: bodyForMeta?.mode || 'rag',
           stream: false,
@@ -154,6 +205,9 @@ export default async function chatRoutes(fastify: FastifyInstance) {
           user_id: bodyForMeta?.userId || null,
           request_id: requestId,
           run_id: runId,
+          model_provider: String(bodyForMeta?.modelProvider || '').trim() || null,
+          model_name: String(bodyForMeta?.modelName || '').trim() || null,
+          agent_pipeline: String(bodyForMeta?.agentPipeline || '').trim().toLowerCase() || null,
         },
         processOutputs: (outputs) => sanitizeNodeChatTraceOutputs(outputs as Readonly<ChatResponse>),
       },
@@ -208,6 +262,10 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       const agent_pipeline =
         mode === 'agent' && (agentPipeline === 'full' || agentPipeline === 'fast') ? agentPipeline : undefined
 
+      // Agent mode does NOT allow client-side model selection: server uses per-agent config/env.
+      const effectiveModelProvider = mode === 'rag' ? modelProvider : undefined
+      const effectiveModelName = mode === 'rag' ? modelName : undefined
+
       const { status: pyStatus, incoming } = await postPythonStream(
         pythonEndpoint,
         {
@@ -217,8 +275,8 @@ export default async function chatRoutes(fastify: FastifyInstance) {
           question: message,
           chat_history: chatHistory,
           use_graph: useGraph,
-          model_provider: modelProvider,
-          model_name: modelName,
+          model_provider: effectiveModelProvider,
+          model_name: effectiveModelName,
           ...(agent_pipeline ? { agent_pipeline } : {}),
         },
         { ...lsHeaders, ...requestHeaders },
@@ -257,9 +315,30 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       return null
       },
       {
-        name: 'node_chat_stream',
+        name: buildLangsmithRunName({
+          endpoint: '/api/chat/stream',
+          mode: String((request.body as any)?.mode || 'rag'),
+          stream: true,
+          modelProvider: String((request.body as any)?.modelProvider || ''),
+          modelName: String((request.body as any)?.modelName || ''),
+          agentPipeline: String((request.body as any)?.agentPipeline || ''),
+        }),
         run_type: 'chain',
-        tags: ['service:node', 'endpoint:/api/chat/stream'],
+        tags: [
+          'service:node',
+          'endpoint:/api/chat/stream',
+          `mode:${String((request.body as any)?.mode || 'rag')}`,
+          `stream:true`,
+          ...(((request.body as any)?.modelProvider || '').toString().trim()
+            ? [`model_provider:${String((request.body as any).modelProvider).trim()}`]
+            : []),
+          ...(((request.body as any)?.modelName || '').toString().trim()
+            ? [`model_name:${String((request.body as any).modelName).trim()}`]
+            : []),
+          ...(((request.body as any)?.agentPipeline || '').toString().trim()
+            ? [`agent_pipeline:${String((request.body as any).agentPipeline).trim().toLowerCase()}`]
+            : []),
+        ],
         metadata: {
           mode: (request.body as any)?.mode || 'rag',
           stream: true,
@@ -267,6 +346,9 @@ export default async function chatRoutes(fastify: FastifyInstance) {
           user_id: (request.body as any)?.userId || null,
           request_id: requestId,
           run_id: runId,
+          model_provider: String((request.body as any)?.modelProvider || '').trim() || null,
+          model_name: String((request.body as any)?.modelName || '').trim() || null,
+          agent_pipeline: String((request.body as any)?.agentPipeline || '').trim().toLowerCase() || null,
         },
       },
     )

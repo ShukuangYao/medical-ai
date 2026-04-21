@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Dict, AsyncGenerator, Any, Optional, List, Tuple, Literal
 import asyncio
 import json
+import hashlib
 import os
 import re
 import time
@@ -16,6 +17,10 @@ from app.core.rag_engine import LocalDocQA
 from app.core.graph_querier import GraphQuerier
 from app.core.intent_classifier_v2 import HybridIntentClassifier
 from app.core.session_store import SessionStore
+from app.core.tools.base import ToolContext, ToolError
+from app.core.tools.executor import ToolExecutor
+from app.core.tools.registry import ToolRegistry
+from app.core.tools.impl import GraphQueryTool, HybridRetrieveTool, RerankTool, RewriteQuestionTool
 
 from langsmith import RunTree
 from langsmith.run_helpers import get_current_run_tree, tracing_context
@@ -27,12 +32,38 @@ class MedicalAgentOrchestrator:
     def __init__(self, rag_engine: LocalDocQA, graph_querier: GraphQuerier):
         self.rag = rag_engine
         self.graph = graph_querier
-        self.llm = OpenAILLM.from_provider(provider="qwen", model_name=settings.LLM_MODEL)
+        _ap0 = settings.AGENT_DEFAULT_LLM_PROVIDER
+        if _ap0 not in ("qwen", "deepseek"):
+            _ap0 = "deepseek"
+        if _ap0 == "deepseek":
+            self.llm = OpenAILLM.from_provider(provider="deepseek", model_name=None)
+        else:
+            self.llm = OpenAILLM.from_provider(provider="qwen", model_name=settings.LLM_MODEL)
         self.intent_classifier = HybridIntentClassifier(llm=self.llm)
         self.session_store = SessionStore(settings.CHAT_DB_PATH)
+        # Tool boundary: unify validation/error codes/trace spans for evidence retrieval and graph queries.
+        self.tools: Optional[ToolExecutor] = None
+        try:
+            reg = ToolRegistry()
+            retriever = getattr(self.rag, "retriever", None)
+            reranker = getattr(self.rag, "reranker", None)
+            rewrite_chain = getattr(self.rag, "rewrite_chain", None)
+            if retriever is not None:
+                reg.register(HybridRetrieveTool(retriever))
+            if reranker is not None:
+                reg.register(RerankTool(reranker))
+            reg.register(GraphQueryTool(self.graph))
+            if rewrite_chain is not None:
+                reg.register(RewriteQuestionTool(rewrite_chain))
+            self.tools = ToolExecutor(registry=reg)
+        except Exception:
+            self.tools = None
         # In-process cache for evidence retrieval to reduce repeated heavy rerank calls.
         # key: query -> (ts, sources, brief)
         self._evidence_cache: Dict[str, Tuple[float, List[Dict[str, Any]], str]] = {}
+        # In-process cache for expensive Validator/Extractor results (record -> prepared outputs).
+        # key: sha256(record_text) -> (ts, validated_record, structured_case)
+        self._record_prepare_cache: Dict[str, Tuple[float, Dict[str, Any], Dict[str, Any]]] = {}
 
         # 对话历史（用于展示推理过程）
         self.conversation_history = []
@@ -63,8 +94,30 @@ class MedicalAgentOrchestrator:
             "timeout": 90,
         }
 
+    def _agent_llm_config(
+        self,
+        *,
+        default_provider: Optional[str],
+        default_model_name: Optional[str],
+        override_provider_env: str,
+        override_model_env: str,
+    ) -> Dict[str, Any]:
+        """Build per-agent llm_config with optional env overrides."""
+        p = (os.getenv(override_provider_env, "") or "").strip() or (default_provider or None)
+        m = (os.getenv(override_model_env, "") or "").strip() or (default_model_name or None)
+        return self._llm_config(provider=p, model_name=m)
+
     def _create_agents(self, *, provider: Optional[str], model_name: Optional[str]) -> Dict[str, ConversableAgent]:
-        llm_config = self._llm_config(provider=provider, model_name=model_name)
+        # When provider=deepseek, all agents share one default: deepseek-chat (latency/JSON 稳定性更好).
+        # Per-role overrides: AGENT_MODEL_* / AGENT_PROVIDER_* env vars still win in `_agent_llm_config`.
+        p_norm = (provider or "").strip().lower()
+        base_model = model_name
+        if p_norm == "deepseek":
+            base_model = base_model or "deepseek-chat"
+
+        def _model_for(_role: str) -> Optional[str]:
+            return base_model
+
         common_rules = (
             "要求：\n"
             "1) 只输出JSON，不要Markdown、不加解释文字。\n"
@@ -73,72 +126,104 @@ class MedicalAgentOrchestrator:
             "4) 医疗建议必须保守、以就医与检查为导向，避免具体处方与剂量。\n"
             "5) 禁止捏造用户画像：不得凭空补全年龄/性别/妊娠/基础病/用药/检查结果等个体事实；只能使用输入文本或明确给定的结构化字段。\n"
         )
-
-        intent_agent = ConversableAgent(
-            name="IntentAgent",
-            system_message="你是医疗意图与问题消解专家。" + common_rules,
-            llm_config=llm_config,
-            human_input_mode="NEVER",
-        )
         validator = ConversableAgent(
             name="RecordValidator",
             system_message="你是病历质量审核与纠错专家（字段完整性、矛盾、单位/术语规范化）。" + common_rules,
-            llm_config=llm_config,
+            llm_config=self._agent_llm_config(
+                default_provider=provider,
+                default_model_name=_model_for("validator"),
+                override_provider_env="AGENT_PROVIDER_VALIDATOR",
+                override_model_env="AGENT_MODEL_VALIDATOR",
+            ),
             human_input_mode="NEVER",
         )
         extractor = ConversableAgent(
             name="SymptomExtractor",
             system_message="你是病历结构化抽取专家（主诉、症状、病史、用药、过敏、检查）。" + common_rules,
-            llm_config=llm_config,
+            llm_config=self._agent_llm_config(
+                default_provider=provider,
+                default_model_name=_model_for("extractor"),
+                override_provider_env="AGENT_PROVIDER_EXTRACTOR",
+                override_model_env="AGENT_MODEL_EXTRACTOR",
+            ),
             human_input_mode="NEVER",
         )
         analyst = ConversableAgent(
             name="ConditionAnalyst",
             system_message="你是病症分析与鉴别诊断专家（强调不确诊，给出候选与依据）。" + common_rules,
-            llm_config=llm_config,
+            llm_config=self._agent_llm_config(
+                default_provider=provider,
+                default_model_name=_model_for("analyst"),
+                override_provider_env="AGENT_PROVIDER_ANALYST",
+                override_model_env="AGENT_MODEL_ANALYST",
+            ),
             human_input_mode="NEVER",
         )
-        triage = ConversableAgent(
-            name="TriageNurse",
-            system_message="你是分诊护士，负责紧急程度分级与红旗征提示。" + common_rules,
-            llm_config=llm_config,
-            human_input_mode="NEVER",
-        )
-        dept = ConversableAgent(
-            name="DepartmentRecommender",
-            system_message="你是就医科室推荐助手，给出首选与备选科室及理由。" + common_rules,
-            llm_config=llm_config,
+        # Merge roles to reduce LLM calls in `full` pipeline:
+        # - triage + department recommendation are tightly coupled
+        # - next steps planning naturally includes safety review
+        triage_dept = ConversableAgent(
+            name="TriageDept",
+            system_message="你是分诊与就医路径规划助手，负责紧急程度分级（红旗征）与就诊科室推荐。" + common_rules,
+            llm_config=self._agent_llm_config(
+                default_provider=provider,
+                default_model_name=_model_for("triage"),
+                override_provider_env="AGENT_PROVIDER_TRIAGE_DEPT",
+                override_model_env="AGENT_MODEL_TRIAGE_DEPT",
+            ),
             human_input_mode="NEVER",
         )
         planner = ConversableAgent(
-            name="NextStepPlanner",
-            system_message="你是下一步检查/处置规划助手（先做什么、何时就医、注意事项）。" + common_rules,
-            llm_config=llm_config,
-            human_input_mode="NEVER",
-        )
-        safety = ConversableAgent(
-            name="SafetyCritic",
-            system_message="你是医疗安全审阅专家（禁忌、风险、过度自诊自疗纠偏）。" + common_rules,
-            llm_config=llm_config,
+            name="Planner",
+            system_message="你是下一步检查/处置规划与安全审阅助手（先做什么、何时就医、注意事项、禁忌与风险提示）。" + common_rules,
+            llm_config=self._agent_llm_config(
+                default_provider=provider,
+                default_model_name=_model_for("planner"),
+                override_provider_env="AGENT_PROVIDER_PLANNER",
+                override_model_env="AGENT_MODEL_PLANNER",
+            ),
             human_input_mode="NEVER",
         )
         coordinator = ConversableAgent(
             name="Coordinator",
             system_message="你是协调者，负责把各模块结果合并成最终严格JSON，并写一段简短summary。" + common_rules,
-            llm_config=llm_config,
+            llm_config=self._agent_llm_config(
+                default_provider=provider,
+                default_model_name=_model_for("coordinator"),
+                override_provider_env="AGENT_PROVIDER_COORDINATOR",
+                override_model_env="AGENT_MODEL_COORDINATOR",
+            ),
             human_input_mode="NEVER",
         )
         return {
-            "intent": intent_agent,
             "validator": validator,
             "extractor": extractor,
             "analyst": analyst,
-            "triage": triage,
-            "dept": dept,
             "planner": planner,
-            "safety": safety,
+            # keep key name `triage` for minimal downstream changes; it now outputs triage+department
+            "triage": triage_dept,
             "coordinator": coordinator,
         }
+
+    @staticmethod
+    def _agent_llm_identity(agent: ConversableAgent) -> Tuple[str, str, str]:
+        """Best-effort (model_id, base_url, provider_guess) for LangSmith labeling."""
+        cfg = getattr(agent, "llm_config", None) or {}
+        cl = cfg.get("config_list") if isinstance(cfg, dict) else None
+        first = cl[0] if isinstance(cl, list) and cl and isinstance(cl[0], dict) else {}
+        model = str(first.get("model") or "").strip() or "unknown_model"
+        base_url = str(first.get("base_url") or "").strip().lower()
+        p = "unknown_provider"
+        if "deepseek" in base_url:
+            p = "deepseek"
+        elif "dashscope" in base_url or "compatible-mode" in base_url or "aliyuncs" in base_url:
+            p = "qwen"
+        return model, base_url, p
+
+    @classmethod
+    def _agent_llm_span_name(cls, agent: ConversableAgent, logical_name: str) -> str:
+        model, _, p = cls._agent_llm_identity(agent)
+        return f"{logical_name}:{p}:{model}"
 
     async def _agent_reply(self, agent: ConversableAgent, prompt: str) -> str:
         # autogen agent methods are sync; run them in a thread
@@ -152,6 +237,13 @@ class MedicalAgentOrchestrator:
         cap = float(getattr(settings, "AGENT_FULL_LLM_STEP_TIMEOUT_S", 150.0))
         try:
             return await asyncio.wait_for(self._agent_reply(agent, prompt), timeout=cap)
+        except asyncio.TimeoutError:
+            return "{}"
+
+    async def _agent_reply_capped(self, agent: ConversableAgent, prompt: str, *, cap_s: float) -> str:
+        """Run one autogen step with a custom wall-clock cap (seconds)."""
+        try:
+            return await asyncio.wait_for(self._agent_reply(agent, prompt), timeout=float(cap_s))
         except asyncio.TimeoutError:
             return "{}"
 
@@ -328,6 +420,15 @@ class MedicalAgentOrchestrator:
             return
         report["summary"] = "已完成病历分析（结果仅供参考，不能替代专业医生的诊断与建议）。"
 
+    @staticmethod
+    def _truncate_for_prompt(text: str, max_chars: int) -> str:
+        t = (text or "").strip()
+        if max_chars <= 0:
+            return ""
+        if len(t) <= max_chars:
+            return t
+        return t[:max_chars] + "..."
+
     async def _retrieve_evidence(self, *, query: str, intent_result: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict[str, Any]], str]:
         """
         Retrieve sources for grounding (retrieval-only; no LLM generation).
@@ -350,20 +451,74 @@ class MedicalAgentOrchestrator:
         sources: List[Dict[str, Any]] = []
         brief: List[str] = []
         try:
-            router = getattr(self.rag, "intent_router", None)
-            if router is None:
-                return [], "未检索到可用参考资料"
-
-            # Build an intent_result-like object for IntentRouter.
             ir = intent_result or {}
             intent = str(ir.get("intent") or "general_medical")
             entity = ir.get("entity")
             use_graph = bool(ir.get("use_graph", True))
-            docs, _strategy = await router.route(
-                {"intent": intent, "entity": entity, "use_graph": use_graph},
-                q,
-                graph_enabled=True,
-            )
+
+            docs: List[Dict[str, Any]] = []
+            # Prefer tool boundary if available (Phase 1): graph_query + hybrid_retrieve + rerank.
+            if self.tools is not None:
+                ctx = ToolContext(mode="agent")
+                graph_docs: List[Dict[str, Any]] = []
+                if use_graph and entity:
+                    graph_docs = await self.tools.run(
+                        "graph_query",
+                        args={"intent": intent, "entity": str(entity)},
+                        ctx=ctx,
+                        trace_inputs={"intent": intent, "entity": str(entity)},
+                        idempotency_key=f"graph_query:{intent}:{entity}",
+                        idempotency_ttl_s=300.0,
+                    )
+                hybrid_docs = await self.tools.run(
+                    "hybrid_retrieve",
+                    args={"query": q},
+                    ctx=ctx,
+                    trace_inputs={"query": q},
+                    idempotency_key=f"hybrid_retrieve:{q}",
+                    idempotency_ttl_s=300.0,
+                )
+
+                # Deduplicate: graph first
+                all_docs = list(graph_docs) + list(hybrid_docs or [])
+                seen = set()
+                unique: List[Dict[str, Any]] = []
+                for d in all_docs:
+                    doc_id = d.get("id", d.get("text", "")[:50])
+                    if doc_id in seen:
+                        continue
+                    seen.add(doc_id)
+                    unique.append(d)
+
+                graph_ids = {d.get("id", d.get("text", "")[:50]) for d in graph_docs}
+                graph_kept = [d for d in unique if d.get("id", d.get("text", "")[:50]) in graph_ids]
+                supplement = [d for d in unique if d.get("id", d.get("text", "")[:50]) not in graph_ids]
+                # Evidence retrieval is for grounding snippets, not for perfect ranking.
+                # Reduce rerank workload to cut tail latency (CrossEncoder can be slow on CPU).
+                # Keep a small candidate set based on existing retrieval score if present.
+                if len(supplement) > 8:
+                    supplement = sorted(supplement, key=lambda d: float(d.get("score", 0.0)), reverse=True)[:8]
+                if len(supplement) > 6:
+                    supplement = await self.tools.run(
+                        "rerank",
+                        args={"query": q, "docs": supplement, "top_k": 8},
+                        ctx=ctx,
+                        trace_inputs={"query": q, "docs_count": len(supplement), "top_k": 8},
+                        idempotency_key=f"rerank:{q}:{len(supplement)}",
+                        idempotency_ttl_s=300.0,
+                    )
+                docs = (graph_kept + supplement)[:10]
+            else:
+                # Fallback to legacy router (keeps behavior if tools init fails)
+                router = getattr(self.rag, "intent_router", None)
+                if router is None:
+                    return [], "未检索到可用参考资料"
+                docs, _strategy = await router.route(
+                    {"intent": intent, "entity": entity, "use_graph": use_graph},
+                    q,
+                    graph_enabled=True,
+                )
+
             for doc in (docs or [])[:5]:
                 src = {
                     "title": doc.get("title", "未知来源"),
@@ -375,6 +530,9 @@ class MedicalAgentOrchestrator:
                 title = src.get("title", "source")
                 content = (src.get("content") or "")[:180]
                 brief.append(f"- {title}: {content}")
+        except ToolError:
+            # Tool boundary already recorded span error; degrade gracefully.
+            pass
         except Exception:
             pass
         brief_text = "\n".join(brief) if brief else "未检索到可用参考资料"
@@ -410,6 +568,13 @@ class MedicalAgentOrchestrator:
         def _thinking(content: str) -> Dict[str, Any]:
             thinking_steps.append(content)
             return {"type": "thinking", "content": content}
+
+        # 多智能体默认走 DeepSeek；仅当请求显式传 qwen/deepseek 时覆盖（RAG 接口不受此项影响）
+        mp_in = (model_provider or "").strip().lower()
+        if mp_in in ("qwen", "deepseek"):
+            model_provider = mp_in
+        else:
+            model_provider = settings.AGENT_DEFAULT_LLM_PROVIDER
 
         # 创建智能体
         agents = self._create_agents(provider=model_provider, model_name=model_name)
@@ -450,6 +615,7 @@ class MedicalAgentOrchestrator:
         with tracing_context(parent=run):
             try:
                 run.post()
+                perf: Dict[str, Any] = {}
                 t0 = time.perf_counter()
                 raw_question = medical_record.strip()
 
@@ -489,10 +655,15 @@ class MedicalAgentOrchestrator:
                 intent_span = run.create_child(
                     name="intent_classify",
                     run_type="tool",
-                    inputs={"raw_question": raw_question},
+                    inputs={
+                        "raw_question": raw_question,
+                        "model_provider": model_provider,
+                        "model_name": model_name,
+                    },
                 )
                 intent_span.post()
-                intent_res = await self.intent_classifier.classify(raw_question)
+                intent_llm = OpenAILLM.from_provider(provider=model_provider, model_name=model_name)
+                intent_res = await HybridIntentClassifier(llm=intent_llm).classify(raw_question)
                 intent_span.end(outputs=intent_res)
                 intent_span.patch()
                 intent_payload = {
@@ -566,10 +737,26 @@ class MedicalAgentOrchestrator:
                 validated_record: Dict[str, Any] = {}
                 structured_case: Dict[str, Any] = {}
                 normalized_text = raw_question
+                raw_short = self._truncate_for_prompt(
+                    raw_question,
+                    int(getattr(settings, "AGENT_FULL_RECORD_MAX_CHARS", 1800)),
+                )
+                cache_key = hashlib.sha256((raw_question or "").encode("utf-8")).hexdigest()
+                cache_ttl = float(getattr(settings, "AGENT_PREPARE_CACHE_TTL_S", 3600.0))
+                now_s = time.time()
 
                 if agent_pipeline == "full":
                     # Legacy: separate validator + extractor (more detailed, slower)
-                    yield _thinking("病历验证与纠错...")
+                    cached = self._record_prepare_cache.get(cache_key)
+                    if cached and (now_s - float(cached[0])) <= cache_ttl:
+                        validated_record = cached[1] or {}
+                        structured_case = cached[2] or {}
+                        normalized_text = str(validated_record.get("normalized_text") or raw_question)
+                        yield _thinking("♻️ 命中缓存：复用病历校验/结构化抽取结果")
+                        yield {"type": "agent_step", "content": {"agent": "RecordValidator", "step": "validated_record", "detail": validated_record}}
+                        yield {"type": "agent_step", "content": {"agent": "SymptomExtractor", "step": "structured_case", "detail": structured_case}}
+                    else:
+                        yield _thinking("病历验证与纠错...")
                     validator_prompt = (
                         "输入为用户给出的病历/描述。请输出 JSON：\n"
                         "{\n"
@@ -581,47 +768,79 @@ class MedicalAgentOrchestrator:
                         "约束：\n"
                         "- normalized_text 只能对原文做“同义替换/单位规范化/纠错/断句”，不得新增任何个人信息或病史事实（例如年龄、性别、透析、高血压等）。\n\n"
                         f"{history_brief}"
-                        f"原文：\n{raw_question}\n"
+                        f"原文（截断）：\n{raw_short}\n"
                     )
-                    validator_span = run.create_child(name="RecordValidator", run_type="llm", inputs={"prompt": validator_prompt})
+                    vm, vbu, vp = self._agent_llm_identity(agents["validator"])
+                    validator_span = run.create_child(
+                        name=self._agent_llm_span_name(agents["validator"], "RecordValidator"),
+                        run_type="llm",
+                        inputs={
+                            "prompt": validator_prompt,
+                            "prompt_chars": len(validator_prompt),
+                            "model": vm,
+                            "provider_guess": vp,
+                            "base_url": vbu,
+                        },
+                    )
                     validator_span.post()
-                    validator_text = await self._agent_reply_full(agents["validator"], validator_prompt)
-                    validator_span.end(outputs={"text": validator_text})
-                    validator_span.patch()
-                    validated_record = self._safe_json(validator_text)
-                    yield {"type": "agent_step", "content": {"agent": "RecordValidator", "step": "validated_record", "detail": validated_record}}
-                    self.conversation_history.append({"agent": "RecordValidator", "message": validator_text})
+                    if not (cached and (now_s - float(cached[0])) <= cache_ttl):
+                        validator_text = await self._agent_reply_full(agents["validator"], validator_prompt)
+                        validator_span.end(outputs={"text": validator_text})
+                        validator_span.patch()
+                        validated_record = self._safe_json(validator_text)
+                        yield {"type": "agent_step", "content": {"agent": "RecordValidator", "step": "validated_record", "detail": validated_record}}
+                        self.conversation_history.append({"agent": "RecordValidator", "message": validator_text})
 
-                    normalized_text = str(validated_record.get("normalized_text") or raw_question)
-                    if self._has_unseen_patient_facts(raw=raw_question, text=normalized_text):
-                        yield _thinking("⚠️ 检测到规范化文本疑似新增个人事实，已回退使用原文继续分析。")
-                        normalized_text = raw_question
+                        normalized_text = str(validated_record.get("normalized_text") or raw_question)
+                        if self._has_unseen_patient_facts(raw=raw_question, text=normalized_text):
+                            yield _thinking("⚠️ 检测到规范化文本疑似新增个人事实，已回退使用原文继续分析。")
+                            normalized_text = raw_question
 
-                    yield _thinking("结构化抽取关键信息...")
-                    extractor_prompt = (
-                        "请从病历文本抽取结构化信息，输出 JSON：\n"
-                        "{\n"
-                        '  "chief_complaint": "...",\n'
-                        '  "symptoms": ["..."],\n'
-                        '  "duration": "...",\n'
-                        '  "vitals": { "体温": "...", "脉搏": "...", "血压": "...", "血氧": "..." },\n'
-                        '  "history": { "既往史": "...", "家族史": "...", "个人史": "...", "手术史": "..." },\n'
-                        '  "medications": ["..."],\n'
-                        '  "allergies": ["..."],\n'
-                        '  "tests": [ { "name": "...", "value": "...", "unit": "...", "note": "..." } ]\n'
-                        "}\n\n"
-                        "约束：\n"
-                        "- 只抽取原文中明确出现的信息；原文未提到的字段填空字符串/空数组/空对象。\n\n"
-                        f"病历文本：\n{normalized_text}\n"
-                    )
-                    extractor_span = run.create_child(name="SymptomExtractor", run_type="llm", inputs={"prompt": extractor_prompt})
-                    extractor_span.post()
-                    extractor_text = await self._agent_reply_full(agents["extractor"], extractor_prompt)
-                    extractor_span.end(outputs={"text": extractor_text})
-                    extractor_span.patch()
-                    structured_case = self._safe_json(extractor_text)
-                    yield {"type": "agent_step", "content": {"agent": "SymptomExtractor", "step": "structured_case", "detail": structured_case}}
-                    self.conversation_history.append({"agent": "SymptomExtractor", "message": extractor_text})
+                        yield _thinking("结构化抽取关键信息...")
+                        extractor_prompt = (
+                            "请从病历文本抽取结构化信息，输出 JSON：\n"
+                            "{\n"
+                            '  "chief_complaint": "...",\n'
+                            '  "symptoms": ["..."],\n'
+                            '  "duration": "...",\n'
+                            '  "vitals": { "体温": "...", "脉搏": "...", "血压": "...", "血氧": "..." },\n'
+                            '  "history": { "既往史": "...", "家族史": "...", "个人史": "...", "手术史": "..." },\n'
+                            '  "medications": ["..."],\n'
+                            '  "allergies": ["..."],\n'
+                            '  "tests": [ { "name": "...", "value": "...", "unit": "...", "note": "..." } ]\n'
+                            "}\n\n"
+                            "约束：\n"
+                            "- 只抽取原文中明确出现的信息；原文未提到的字段填空字符串/空数组/空对象。\n\n"
+                            f"病历文本（截断）：\n{self._truncate_for_prompt(normalized_text, int(getattr(settings, 'AGENT_FULL_RECORD_MAX_CHARS', 1800)))}\n"
+                        )
+                        em, ebu, ep = self._agent_llm_identity(agents["extractor"])
+                        extractor_span = run.create_child(
+                            name=self._agent_llm_span_name(agents["extractor"], "SymptomExtractor"),
+                            run_type="llm",
+                            inputs={
+                                "prompt": extractor_prompt,
+                                "prompt_chars": len(extractor_prompt),
+                                "model": em,
+                                "provider_guess": ep,
+                                "base_url": ebu,
+                            },
+                        )
+                        extractor_span.post()
+                        extractor_text = await self._agent_reply_full(agents["extractor"], extractor_prompt)
+                        extractor_span.end(outputs={"text": extractor_text})
+                        extractor_span.patch()
+                        structured_case = self._safe_json(extractor_text)
+                        yield {"type": "agent_step", "content": {"agent": "SymptomExtractor", "step": "structured_case", "detail": structured_case}}
+                        self.conversation_history.append({"agent": "SymptomExtractor", "message": extractor_text})
+
+                        try:
+                            self._record_prepare_cache[cache_key] = (
+                                now_s,
+                                validated_record if isinstance(validated_record, dict) else {},
+                                structured_case if isinstance(structured_case, dict) else {},
+                            )
+                        except Exception:
+                            pass
                 else:
                     # Fast: validate + extract in ONE LLM call
                     yield _thinking("病历规范化与结构化抽取（合并步骤）...")
@@ -652,7 +871,18 @@ class MedicalAgentOrchestrator:
                         f"{history_brief}"
                         f"原文：\n{raw_question}\n"
                     )
-                    prepare_span = run.create_child(name="RecordPrepare", run_type="llm", inputs={"prompt": prepare_prompt})
+                    pm, pbu, pp = self._agent_llm_identity(agents["validator"])
+                    prepare_span = run.create_child(
+                        name=self._agent_llm_span_name(agents["validator"], "RecordPrepare"),
+                        run_type="llm",
+                        inputs={
+                            "prompt": prepare_prompt,
+                            "prompt_chars": len(prepare_prompt),
+                            "model": pm,
+                            "provider_guess": pp,
+                            "base_url": pbu,
+                        },
+                    )
                     prepare_span.post()
                     prepare_text = await self._agent_reply(agents["validator"], prepare_prompt)
                     prepare_span.end(outputs={"text": prepare_text})
@@ -686,78 +916,30 @@ class MedicalAgentOrchestrator:
                     str(intent_res.get("entity") or "").strip(),
                 ]
                 retrieval_query = "；".join([p for p in retrieval_query_parts if p])
-                ev_span = run.create_child(name="retrieve_evidence", run_type="retriever", inputs={"query": str(retrieval_query)})
+                perf["evidence_query_chars"] = len(str(retrieval_query))
+                ev_span = run.create_child(
+                    name="retrieve_evidence",
+                    run_type="retriever",
+                    inputs={"query": str(retrieval_query), "query_chars": len(str(retrieval_query))},
+                )
                 ev_span.post()
                 retrieve_task = asyncio.create_task(
                     self._retrieve_evidence(query=str(retrieval_query), intent_result=intent_res)
                 )
 
-                triage_parallel_task: Optional[asyncio.Task[str]] = None
-                safety_parallel_task: Optional[asyncio.Task[str]] = None
+                # In `full`, we will run merged agents later (after evidence retrieval):
+                # - TriageDept: triage + department
+                # - Planner: next_steps + treatment_safety
                 triage_text_parallel = ""
                 safety_text_parallel = ""
-
-                if agent_pipeline == "full":
-                    triage_prompt_parallel = (
-                        "请根据病历判断紧急程度，输出 JSON：\n"
-                        "{\n"
-                        '  "severity_level": "emergency|urgent|routine",\n'
-                        '  "red_flags": ["红旗征..."],\n'
-                        '  "why": "分级理由（简短）"\n'
-                        "}\n\n"
-                        f"病历文本：\n{normalized_text}\n"
-                    )
-                    safety_prompt_parallel = (
-                        "请输出 JSON：\n"
-                        "{\n"
-                        '  "medication_considerations": ["用药考虑（不写剂量，不开处方）..."],\n'
-                        '  "contraindications": ["常见禁忌/不适用情况..."],\n'
-                        '  "cautions": ["其他安全提醒..."]\n'
-                        "}\n\n"
-                        f"病历文本：\n{normalized_text}\n"
-                    )
-                    triage_span_parallel = run.create_child(
-                        name="TriageNurse", run_type="llm", inputs={"prompt": triage_prompt_parallel}
-                    )
-                    triage_span_parallel.post()
-
-                    async def _triage_parallel() -> str:
-                        try:
-                            txt = await self._agent_reply_full(agents["triage"], triage_prompt_parallel)
-                        except Exception as e:
-                            triage_span_parallel.end(error=str(e))
-                            triage_span_parallel.patch()
-                            raise
-                        triage_span_parallel.end(outputs={"text": txt})
-                        triage_span_parallel.patch()
-                        return txt
-
-                    triage_parallel_task = asyncio.create_task(_triage_parallel())
-
-                    safety_span_parallel = run.create_child(
-                        name="SafetyCritic", run_type="llm", inputs={"prompt": safety_prompt_parallel}
-                    )
-                    safety_span_parallel.post()
-
-                    async def _safety_parallel() -> str:
-                        try:
-                            txt = await self._agent_reply_full(agents["safety"], safety_prompt_parallel)
-                        except Exception as e:
-                            safety_span_parallel.end(error=str(e))
-                            safety_span_parallel.patch()
-                            raise
-                        safety_span_parallel.end(outputs={"text": txt})
-                        safety_span_parallel.patch()
-                        return txt
-
-                    safety_parallel_task = asyncio.create_task(_safety_parallel())
 
                 sources: List[Dict[str, Any]] = []
                 sources_brief: str = "未检索到可用参考资料"
 
                 async def _await_retrieve_full() -> Tuple[List[Dict[str, Any]], str]:
                     try:
-                        return await asyncio.wait_for(retrieve_task, timeout=45)
+                        cap = float(getattr(settings, "AGENT_EVIDENCE_TIMEOUT_FULL_S", 25.0))
+                        return await asyncio.wait_for(retrieve_task, timeout=cap)
                     except Exception:
                         try:
                             retrieve_task.cancel()
@@ -766,17 +948,13 @@ class MedicalAgentOrchestrator:
                         return [], "未检索到可用参考资料"
 
                 if agent_pipeline == "full":
-                    assert triage_parallel_task is not None and safety_parallel_task is not None
-                    # gather returns one value per task: (sources, brief) tuple, triage str, safety str — not 4 top-level values
-                    retrieve_pack, triage_text_parallel, safety_text_parallel = await asyncio.gather(
-                        _await_retrieve_full(),
-                        triage_parallel_task,
-                        safety_parallel_task,
-                    )
-                    sources, sources_brief = retrieve_pack
+                    # NOTE: do NOT wait for triage/safety here; they can be slow and would block downstream steps.
+                    # We only await retrieval budget here to populate sources early (if available).
+                    sources, sources_brief = await _await_retrieve_full()
                 else:
                     try:
-                        sources, sources_brief = await asyncio.wait_for(retrieve_task, timeout=10)
+                        cap = float(getattr(settings, "AGENT_EVIDENCE_TIMEOUT_FAST_S", 10.0))
+                        sources, sources_brief = await asyncio.wait_for(retrieve_task, timeout=cap)
                     except Exception:
                         try:
                             retrieve_task.cancel()
@@ -797,7 +975,19 @@ class MedicalAgentOrchestrator:
 
                 if agent_pipeline == "full":
                     # Legacy multi-agent path: separate LLM calls + coordinator merge
-                    yield _thinking("病症分析与鉴别诊断候选...")
+                    yield _thinking("病症分析 / 分诊科室 / 下一步安全（并行）...")
+                    # Keep prompts short to reduce latency/cost while preserving accuracy:
+                    # Condition analysis mainly needs key fields + brief evidence, not the full raw text.
+                    brief_cap = 900
+                    try:
+                        brief_cap = int(getattr(settings, "AGENT_PARALLEL_PROMPT_MAX_CHARS", 1200))
+                    except Exception:
+                        brief_cap = 900
+                    sources_brief_short = self._truncate_for_prompt(sources_brief, max(200, min(brief_cap, 1200)))
+                    case_short = self._truncate_for_prompt(
+                        json.dumps(structured_case, ensure_ascii=False),
+                        max(600, min(brief_cap, 1600)),
+                    )
                     analyst_prompt = (
                         "请基于结构化病历与参考资料，输出 JSON：\n"
                         "{\n"
@@ -807,122 +997,219 @@ class MedicalAgentOrchestrator:
                         "约束：\n"
                         "- 不能把参考资料中的“某个病例/某个患者”的人口学信息当作用户事实。\n"
                         "- 用户画像（年龄/性别/基础病/用药/检查结果）只能来自原文或结构化病历；缺失则保持未知。\n\n"
-                        f"结构化病历：\n{json.dumps(structured_case, ensure_ascii=False)}\n\n"
-                        f"参考资料摘要：\n{sources_brief}\n\n"
+                        f"结构化病历（截断）：\n{case_short}\n\n"
+                        f"参考资料摘要（截断）：\n{sources_brief_short}\n\n"
                         "要求：\n"
                         "- 只能基于病历与参考资料，不要凭空引入未出现的新疾病名\n"
                     )
-                    analyst_span = run.create_child(name="ConditionAnalyst", run_type="llm", inputs={"prompt": analyst_prompt})
+                    perf["analyst_prompt_chars"] = len(analyst_prompt)
+                    perf["analyst_structured_case_chars"] = len(case_short)
+                    perf["analyst_sources_brief_chars"] = len(sources_brief_short)
+                    am, abu, ap = self._agent_llm_identity(agents["analyst"])
+                    analyst_span = run.create_child(
+                        name=self._agent_llm_span_name(agents["analyst"], "ConditionAnalyst"),
+                        run_type="llm",
+                        inputs={
+                            "prompt": analyst_prompt,
+                            "prompt_chars": len(analyst_prompt),
+                            "structured_case_chars": len(case_short),
+                            "sources_brief_chars": len(sources_brief_short),
+                            "model": am,
+                            "provider_guess": ap,
+                            "base_url": abu,
+                        },
+                    )
                     analyst_span.post()
-                    analyst_text = await self._agent_reply_full(agents["analyst"], analyst_prompt)
-                    analyst_span.end(outputs={"text": analyst_text})
-                    analyst_span.patch()
+                    norm_short2 = self._truncate_for_prompt(
+                        normalized_text,
+                        int(getattr(settings, "AGENT_PARALLEL_PROMPT_MAX_CHARS", 1200)),
+                    )
+
+                    async def _analyst_llm() -> str:
+                        try:
+                            txt = await self._agent_reply_full(agents["analyst"], analyst_prompt)
+                        except Exception as e:
+                            analyst_span.end(error=str(e))
+                            analyst_span.patch()
+                            raise
+                        analyst_span.end(outputs={"text": txt})
+                        analyst_span.patch()
+                        return txt
+
+                    # Merged roles: one call for triage+department, one call for plan+safe.
+                    triage_dept_prompt = (
+                        "请严格输出一个 JSON 对象，顶层包含两个键：triage 与 department。\n"
+                        "{\n"
+                        '  "triage": {\n'
+                        '    "severity_level": "emergency|urgent|routine",\n'
+                        '    "red_flags": ["红旗征..."],\n'
+                        '    "why": "分级理由（简短）"\n'
+                        "  },\n"
+                        '  "department": {\n'
+                        '    "recommended": ["首选科室..."],\n'
+                        '    "alternatives": ["备选科室..."],\n'
+                        '    "reason": "理由（简短）"\n'
+                        "  }\n"
+                        "}\n\n"
+                        "约束：\n"
+                        "- triage 用保守原则：信息不足时优先提示就医与急诊阈值。\n"
+                        "- department 只回答科室选择与就医路径，不要下具体诊断结论。\n\n"
+                        f"结构化病历要点（截断）：\n{case_short}\n\n"
+                        f"病历文本（截断）：\n{norm_short2}\n\n"
+                        f"参考资料摘要（截断）：\n{sources_brief_short}\n"
+                    )
+                    plan_safety_prompt = (
+                        "请严格输出一个 JSON 对象，顶层包含两个键：next_steps 与 treatment_safety。\n"
+                        "{\n"
+                        '  "next_steps": {\n'
+                        '    "immediate_actions": ["立即能做的措施（非处方）...（至少2条，无法判断也给通用且安全的建议）"],\n'
+                        '    "recommended_tests": ["建议检查...（至少2条，无法判断也给通用检查项）"],\n'
+                        '    "when_to_seek_care": ["何时就医/急诊..."]\n'
+                        "  },\n"
+                        '  "treatment_safety": {\n'
+                        '    "medication_considerations": ["用药考虑（不写剂量，不开处方）..."],\n'
+                        '    "contraindications": ["常见禁忌/不适用情况..."],\n'
+                        '    "cautions": ["其他安全提醒..."]\n'
+                        "  }\n"
+                        "}\n\n"
+                        "约束：\n"
+                        "- 不要给具体处方与剂量；建议以检查/就医/观察为主。\n"
+                        "- 安全提醒要覆盖常见风险与需线下确认的关键问题。\n\n"
+                        f"结构化病历要点（截断）：\n{case_short}\n\n"
+                        f"病历文本（截断）：\n{norm_short2}\n\n"
+                        f"参考资料摘要（截断）：\n{sources_brief_short}\n"
+                    )
+                    perf["triage_dept_prompt_chars"] = len(triage_dept_prompt)
+                    perf["plan_safety_prompt_chars"] = len(plan_safety_prompt)
+
+                    tm, tbu, tp = self._agent_llm_identity(agents["triage"])
+                    triage_dept_span = run.create_child(
+                        name=self._agent_llm_span_name(agents["triage"], "TriageDept"),
+                        run_type="llm",
+                        inputs={
+                            "prompt": triage_dept_prompt,
+                            "prompt_chars": len(triage_dept_prompt),
+                            "model": tm,
+                            "provider_guess": tp,
+                            "base_url": tbu,
+                        },
+                    )
+                    triage_dept_span.post()
+                    plm, plbu, plp = self._agent_llm_identity(agents["planner"])
+                    plan_safety_span = run.create_child(
+                        name=self._agent_llm_span_name(agents["planner"], "Planner"),
+                        run_type="llm",
+                        inputs={
+                            "prompt": plan_safety_prompt,
+                            "prompt_chars": len(plan_safety_prompt),
+                            "model": plm,
+                            "provider_guess": plp,
+                            "base_url": plbu,
+                        },
+                    )
+                    plan_safety_span.post()
+
+                    async def _triage_dept_llm() -> str:
+                        try:
+                            txt = await self._agent_reply_full(agents["triage"], triage_dept_prompt)
+                        except Exception as e:
+                            triage_dept_span.end(error=str(e))
+                            triage_dept_span.patch()
+                            raise
+                        triage_dept_span.end(outputs={"text": txt})
+                        triage_dept_span.patch()
+                        return txt
+
+                    async def _plan_safety_llm() -> str:
+                        try:
+                            txt = await self._agent_reply_full(agents["planner"], plan_safety_prompt)
+                        except Exception as e:
+                            plan_safety_span.end(error=str(e))
+                            plan_safety_span.patch()
+                            raise
+                        plan_safety_span.end(outputs={"text": txt})
+                        plan_safety_span.patch()
+                        return txt
+
+                    analyst_text, triage_dept_text, plan_safety_text = await asyncio.gather(
+                        _analyst_llm(), _triage_dept_llm(), _plan_safety_llm()
+                    )
                     symptom_analysis = self._safe_json(analyst_text)
                     yield {"type": "agent_step", "content": {"agent": "ConditionAnalyst", "step": "symptom_analysis", "detail": symptom_analysis}}
                     self.conversation_history.append({"agent": "ConditionAnalyst", "message": analyst_text})
 
-                    triage = self._safe_json(triage_text_parallel)
-                    treatment_safety = self._safe_json(safety_text_parallel)
+                    merged_td = self._safe_json(triage_dept_text)
+                    triage = merged_td.get("triage") if isinstance(merged_td, dict) else {}
+                    department = merged_td.get("department") if isinstance(merged_td, dict) else {}
+                    if not isinstance(triage, dict):
+                        triage = {}
+                    if not isinstance(department, dict):
+                        department = {}
+                    merged_ps = self._safe_json(plan_safety_text)
+                    next_steps = merged_ps.get("next_steps") if isinstance(merged_ps, dict) else {}
+                    treatment_safety = merged_ps.get("treatment_safety") if isinstance(merged_ps, dict) else {}
+                    if not isinstance(next_steps, dict):
+                        next_steps = {}
+                    if not isinstance(treatment_safety, dict):
+                        treatment_safety = {}
+
                     yield {"type": "agent_step", "content": {"agent": "TriageNurse", "step": "triage", "detail": triage}}
-                    self.conversation_history.append({"agent": "TriageNurse", "message": triage_text_parallel})
-                    yield {"type": "agent_step", "content": {"agent": "SafetyCritic", "step": "treatment_safety", "detail": treatment_safety}}
-                    self.conversation_history.append({"agent": "SafetyCritic", "message": safety_text_parallel})
-
-                    yield _thinking("推荐就诊科室与下一步计划（并行）...")
-                    dept_prompt = (
-                        "请输出 JSON：\n"
-                        "{\n"
-                        '  "recommended": ["首选科室..."],\n'
-                        '  "alternatives": ["备选科室..."],\n'
-                        '  "reason": "理由（简短）"\n'
-                        "}\n\n"
-                        f"病历要点：\n{json.dumps(symptom_analysis, ensure_ascii=False)}\n"
-                    )
-                    planner_prompt = (
-                        "请输出 JSON：\n"
-                        "{\n"
-                        '  "immediate_actions": ["立即能做的措施（非处方）...（至少2条，无法判断也给通用且安全的建议）"],\n'
-                        '  "recommended_tests": ["建议检查...（至少2条，无法判断也给通用检查项）"],\n'
-                        '  "when_to_seek_care": ["何时就医/急诊..."]\n'
-                        "}\n\n"
-                        f"病历文本：\n{normalized_text}\n\n"
-                        f"紧急程度：\n{json.dumps(triage, ensure_ascii=False)}\n"
-                    )
-                    dept_span = run.create_child(name="DepartmentRecommender", run_type="llm", inputs={"prompt": dept_prompt})
-                    dept_span.post()
-                    planner_span = run.create_child(name="NextStepPlanner", run_type="llm", inputs={"prompt": planner_prompt})
-                    planner_span.post()
-
-                    async def _dept_llm() -> str:
-                        try:
-                            txt = await self._agent_reply_full(agents["dept"], dept_prompt)
-                        except Exception as e:
-                            dept_span.end(error=str(e))
-                            dept_span.patch()
-                            raise
-                        dept_span.end(outputs={"text": txt})
-                        dept_span.patch()
-                        return txt
-
-                    async def _planner_llm() -> str:
-                        try:
-                            txt = await self._agent_reply_full(agents["planner"], planner_prompt)
-                        except Exception as e:
-                            planner_span.end(error=str(e))
-                            planner_span.patch()
-                            raise
-                        planner_span.end(outputs={"text": txt})
-                        planner_span.patch()
-                        return txt
-
-                    dept_text, planner_text = await asyncio.gather(_dept_llm(), _planner_llm())
-                    department = self._safe_json(dept_text)
-                    next_steps = self._safe_json(planner_text)
+                    self.conversation_history.append({"agent": "TriageDept", "message": triage_dept_text})
                     _tmp_report = {"triage": triage, "next_steps": next_steps}
                     self._ensure_next_steps_minimum(_tmp_report)
                     next_steps = _tmp_report.get("next_steps") or {}
                     yield {"type": "agent_step", "content": {"agent": "DepartmentRecommender", "step": "department", "detail": department}}
-                    self.conversation_history.append({"agent": "DepartmentRecommender", "message": dept_text})
+                    self.conversation_history.append({"agent": "TriageDept", "message": triage_dept_text})
                     yield {"type": "agent_step", "content": {"agent": "NextStepPlanner", "step": "next_steps", "detail": next_steps}}
-                    self.conversation_history.append({"agent": "NextStepPlanner", "message": planner_text})
+                    self.conversation_history.append({"agent": "Planner", "message": plan_safety_text})
+                    yield {"type": "agent_step", "content": {"agent": "SafetyCritic", "step": "treatment_safety", "detail": treatment_safety}}
+                    self.conversation_history.append({"agent": "Planner", "message": plan_safety_text})
 
                     yield _thinking("汇总生成最终结构化报告...")
-                    coordinator_prompt = (
-                        "请把以下模块结果合并为最终 JSON，字段必须完全包含：\n"
-                        "{\n"
-                        '  "validated_record": {...},\n'
-                        '  "intent": {...},\n'
-                        '  "structured_case": {...},\n'
-                        '  "symptom_analysis": {...},\n'
-                        '  "triage": {...},\n'
-                        '  "department": {...},\n'
-                        '  "next_steps": {...},\n'
-                        '  "treatment_safety": {...},\n'
-                        '  "summary": "一句到三句的结论性总结（包含免责声明：不能替代医生）",\n'
-                        '  "trace": [ {"agent": "...", "message": "..." } ]\n'
-                        "}\n\n"
-                        "请确保：\n"
-                        "- severity_level 只能是 emergency/urgent/routine\n"
-                        "- 缺失字段用空字符串/空数组/空对象，不要省略键\n\n"
-                        "重要约束（防幻觉）：\n"
-                        "- 不得捏造用户画像：年龄/性别/妊娠/基础病/用药/检查结果等个体事实只能来自【原文】或上游结构化结果中明确来自原文的字段；不确定就不要写。\n"
-                        "- 参考资料仅用于通用医学依据，不能把其中的“某病例/某患者”信息当作用户事实。\n\n"
-                        f"原文={raw_question}\n"
-                        f"validated_record={json.dumps(validated_record, ensure_ascii=False)}\n"
-                        f"intent={json.dumps(intent_payload, ensure_ascii=False)}\n"
-                        f"structured_case={json.dumps(structured_case, ensure_ascii=False)}\n"
-                        f"symptom_analysis={json.dumps(symptom_analysis, ensure_ascii=False)}\n"
-                        f"triage={json.dumps(triage, ensure_ascii=False)}\n"
-                        f"department={json.dumps(department, ensure_ascii=False)}\n"
-                        f"next_steps={json.dumps(next_steps, ensure_ascii=False)}\n"
-                        f"treatment_safety={json.dumps(treatment_safety, ensure_ascii=False)}\n"
+                    # Optimization (accuracy-first): coordinator should not re-generate the entire JSON.
+                    # We merge module outputs deterministically and only ask LLM for a short summary.
+                    report = {
+                        "validated_record": validated_record,
+                        "intent": intent_payload,
+                        "structured_case": structured_case,
+                        "symptom_analysis": symptom_analysis,
+                        "triage": triage,
+                        "department": department,
+                        "next_steps": next_steps,
+                        "treatment_safety": treatment_safety,
+                        "summary": "",
+                        "trace": [{"agent": h["agent"], "message": h["message"]} for h in self.conversation_history],
+                    }
+                    self._ensure_next_steps_minimum(report)
+
+                    summary_prompt = (
+                        "请基于以下信息输出一段 1-3 句中文总结，并在末尾包含免责声明：不能替代专业医生的诊断与建议。\n"
+                        "要求：不要捏造用户画像，不要给具体处方与剂量。\n\n"
+                        f"原文（截断）：\n{self._truncate_for_prompt(raw_question, 800)}\n\n"
+                        f"紧急程度：{json.dumps(triage, ensure_ascii=False)}\n"
+                        f"就诊科室：{json.dumps(department, ensure_ascii=False)}\n"
+                        f"下一步建议：{json.dumps(next_steps, ensure_ascii=False)}\n"
                     )
-                    coord_span = run.create_child(name="Coordinator", run_type="llm", inputs={"prompt": coordinator_prompt})
+                    perf["coordinator_prompt_chars"] = len(summary_prompt)
+                    cm, cbu, cp = self._agent_llm_identity(agents["coordinator"])
+                    coord_span = run.create_child(
+                        name=self._agent_llm_span_name(agents["coordinator"], "Coordinator"),
+                        run_type="llm",
+                        inputs={
+                            "prompt": summary_prompt,
+                            "prompt_chars": len(summary_prompt),
+                            "mode": "summary_only",
+                            "model": cm,
+                            "provider_guess": cp,
+                            "base_url": cbu,
+                        },
+                    )
                     coord_span.post()
-                    coordinator_text = await self._agent_reply_full(agents["coordinator"], coordinator_prompt)
-                    coord_span.end(outputs={"text": coordinator_text})
-                    coord_span.post()
-                    report = self._safe_json(coordinator_text)
+                    summary_text = await self._agent_reply_full(agents["coordinator"], summary_prompt)
+                    coord_span.end(outputs={"text": summary_text})
+                    coord_span.patch()
+                    report["summary"] = (summary_text or "").strip()
+                    self._ensure_summary_minimum(report)
 
                     if (
                         not isinstance(report, dict)
@@ -976,7 +1263,18 @@ class MedicalAgentOrchestrator:
                         f"【结构化病历】\n{json.dumps(structured_case, ensure_ascii=False)}\n\n"
                         f"【参考资料摘要】\n{sources_brief}\n"
                     )
-                    one_span = run.create_child(name="OneShotReport", run_type="llm", inputs={"prompt": one_shot_prompt})
+                    om, obu, op = self._agent_llm_identity(agents["coordinator"])
+                    one_span = run.create_child(
+                        name=self._agent_llm_span_name(agents["coordinator"], "OneShotReport"),
+                        run_type="llm",
+                        inputs={
+                            "prompt": one_shot_prompt,
+                            "prompt_chars": len(one_shot_prompt),
+                            "model": om,
+                            "provider_guess": op,
+                            "base_url": obu,
+                        },
+                    )
                     one_span.post()
                     one_text = await self._agent_reply(agents["coordinator"], one_shot_prompt)
                     one_span.end(outputs={"text": one_text})
@@ -1052,6 +1350,7 @@ class MedicalAgentOrchestrator:
                         "report": report,
                         "sources": sources,
                         "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+                        "perf": perf,
                     }
                 )
                 run.patch()

@@ -1,8 +1,8 @@
 export type ChatMode = 'rag' | 'agent'
 
 export type ModelProvider = 'qwen' | 'deepseek'
-export type QwenModel = 'qwen-turbo' | 'qwen-plus' | 'qwen-max'
-export type DeepseekModel = 'deepseek-reasoner' | 'deepseek-chat'
+export type QwenModel = 'qwen3.5-flash' | 'qwen3.5-plus'
+export type DeepseekModel = 'deepseek-chat'
 export type ModelName = QwenModel | DeepseekModel
 export type AgentPipeline = 'fast' | 'full'
 
@@ -68,6 +68,9 @@ export interface Message {
   report?: AgentReport
   thinkingSteps?: string[]
   thinkingExpanded?: boolean
+  streaming?: boolean    // 流式输出进行中（用于展示层避免裁剪“半句话”）
+  /** Stream finished (SSE done) AND local typewriter queue flushed to DOM */
+  typewriterDone?: boolean
   pinned?: boolean       // 置顶，始终包含在上下文中
   isSummary?: boolean    // 历史摘要消息
 }

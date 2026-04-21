@@ -29,8 +29,11 @@ export const chatAPI = {
     if (request.sessionId) formData.append('sessionId', request.sessionId)
     if (request.userId) formData.append('userId', request.userId)
     formData.append('useGraph', String(request.useGraph ?? true))
-    if (request.modelProvider) formData.append('modelProvider', request.modelProvider)
-    if (request.modelName) formData.append('modelName', request.modelName)
+    // Agent mode does NOT allow manual model selection; models are configured per-agent on the server.
+    if (request.mode === 'rag') {
+      if (request.modelProvider) formData.append('modelProvider', request.modelProvider)
+      if (request.modelName) formData.append('modelName', request.modelName)
+    }
     if (request.agentPipeline) formData.append('agentPipeline', request.agentPipeline)
     if (request.file) formData.append('file', request.file)
 
@@ -54,8 +57,7 @@ export const chatAPI = {
         userId: request.userId,
         useGraph: request.useGraph ?? true,
         chat_history: request.chatHistory ?? [],
-        modelProvider: request.modelProvider,
-        modelName: request.modelName,
+        ...(request.mode === 'rag' ? { modelProvider: request.modelProvider, modelName: request.modelName } : {}),
         agentPipeline: request.agentPipeline,
       },
       callbacks: {

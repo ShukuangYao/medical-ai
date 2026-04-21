@@ -66,6 +66,56 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
     })
   }, [mode, messages.length, lastMsgKey])
 
+  const parsedAgentSummary = (summaryRaw?: string): { summary: string; disclaimer?: string } => {
+    const t = (summaryRaw ?? '').trim()
+    if (!t) return { summary: '' }
+    if (!(t.startsWith('{') && t.endsWith('}'))) return { summary: t }
+    try {
+      const obj = JSON.parse(t) as unknown
+      if (obj && typeof obj === 'object') {
+        const o = obj as Record<string, unknown>
+        const s = typeof o.summary === 'string' ? o.summary.trim() : ''
+        const d = typeof o.disclaimer === 'string' ? o.disclaimer.trim() : undefined
+        if (s) return { summary: s, disclaimer: d }
+      }
+      return { summary: t }
+    } catch {
+      return { summary: t }
+    }
+  }
+
+  const reorderSourcesByRemappedRefs = (
+    text: string,
+    sources: Array<{ title: string; content: string; page?: number; retrieval_source?: string }>
+  ) => {
+    const maxRef = sources.length
+    if (!text || maxRef <= 0) return sources
+
+    // Extract original reference numbers in first-appearance order (before remapping),
+    // then reorder sources so referenced ones come first.
+    const s = String(text).replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
+    const refs: number[] = []
+    const add = (n: number) => {
+      if (!Number.isFinite(n) || n < 1 || n > maxRef) return
+      if (!refs.includes(n)) refs.push(n)
+    }
+    const scan = (re: RegExp) => {
+      re.lastIndex = 0
+      let m: RegExpExecArray | null
+      while ((m = re.exec(s)) !== null) add(Number(m[1]))
+    }
+    scan(/\[\s*参考\s*([0-9]+)\s*\]/g)
+    scan(/［\s*参考\s*([0-9]+)\s*］/g)
+    scan(/（\s*参考\s*([0-9]+)\s*）/g)
+    scan(/\(\s*参考\s*([0-9]+)\s*\)/g)
+
+    if (refs.length === 0) return sources
+    const picked = refs.map((n) => sources[n - 1]).filter(Boolean)
+    const pickedSet = new Set(refs.map((n) => n - 1))
+    const rest = sources.filter((_, i) => !pickedSet.has(i))
+    return [...picked, ...rest]
+  }
+
   return (
     <div
       ref={containerRef}
@@ -111,26 +161,33 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
                 </Collapse>
               )}
 
-              <Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>
-                <ReactMarkdown
-                  components={{
-                    p: ({ children }) => <p style={{ margin: '0 0 6px 0' }}>{children}</p>,
-                    ul: ({ children }) => (
-                      <ul className="md-list md-unordered">
-                        {children}
-                      </ul>
-                    ),
-                    ol: ({ children }) => (
-                      <ul className="md-list md-ordered">
-                        {children}
-                      </ul>
-                    ),
-                    li: ({ children }) => <li className="md-li">{children}</li>,
-                  }}
-                >
-                  {sanitizeDisplayText(msg.content)}
-                </ReactMarkdown>
-              </Paragraph>
+              {!(mode === 'agent' && msg.role === 'assistant' && msg.report) && (
+                <Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>
+                  <ReactMarkdown
+                    components={{
+                      p: ({ children }) => <p className="md-p" style={{ margin: '0 0 6px 0' }}>{children}</p>,
+                      ul: ({ children }) => (
+                        <ul className="md-list md-unordered">
+                          {children}
+                        </ul>
+                      ),
+                      ol: ({ children }) => (
+                        <ul className="md-list md-ordered">
+                          {children}
+                        </ul>
+                      ),
+                      li: ({ children }) => <li className="md-li">{children}</li>,
+                    }}
+                  >
+                    {sanitizeDisplayText(msg.content, {
+                      // Disable tail trimming to avoid any end-of-stream flicker.
+                      trimIncompleteTail: false,
+                      maxRef: msg.sources?.length ?? 0,
+                      remapRefs: true,
+                    })}
+                  </ReactMarkdown>
+                </Paragraph>
+              )}
 
               {mode === 'agent' && msg.role === 'assistant' && msg.report && (
                 <>
@@ -178,6 +235,51 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
                         </Descriptions.Item>
                       </Descriptions>
                     </Card>
+
+                    <Card size="small" type="inner" title="摘要">
+                      {(() => {
+                        const p = parsedAgentSummary(msg.report?.summary)
+                        return (
+                          <Space direction="vertical" style={{ width: '100%' }} size={6}>
+                            <Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>
+                              <ReactMarkdown
+                                components={{
+                                  p: ({ children }) => <p className="md-p" style={{ margin: '0 0 6px 0' }}>{children}</p>,
+                                  ul: ({ children }) => <ul className="md-list md-unordered">{children}</ul>,
+                                  ol: ({ children }) => <ul className="md-list md-ordered">{children}</ul>,
+                                  li: ({ children }) => <li className="md-li">{children}</li>,
+                                }}
+                              >
+                                {sanitizeDisplayText(p.summary || '—')}
+                              </ReactMarkdown>
+                            </Paragraph>
+                            {p.disclaimer ? (
+                              <Text type="secondary">免责声明：{sanitizeDisplayText(p.disclaimer)}</Text>
+                            ) : null}
+                          </Space>
+                        )
+                      })()}
+                    </Card>
+
+                    <Collapse ghost>
+                      <Panel header="结构化 JSON（可选）" key="report_json">
+                        <pre
+                          style={{
+                            margin: 0,
+                            padding: 12,
+                            background: 'rgba(0,0,0,0.02)',
+                            border: '1px solid rgba(0,0,0,0.06)',
+                            borderRadius: 6,
+                            overflowX: 'auto',
+                            whiteSpace: 'pre',
+                            fontSize: 12,
+                            lineHeight: 1.5,
+                          }}
+                        >
+                          {JSON.stringify(msg.report, null, 2)}
+                        </pre>
+                      </Panel>
+                    </Collapse>
                   </Space>
                 </>
               )}
@@ -186,7 +288,7 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
                 <Collapse ghost>
                   <Panel header={`参考文献 (${msg.sources.length})`} key="sources">
                     <Space direction="vertical" style={{ width: '100%' }} size={6}>
-                      {msg.sources.map((source, idx) => (
+                      {reorderSourcesByRemappedRefs(msg.content, msg.sources).map((source, idx) => (
                         <Card key={idx} size="small" type="inner">
                           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                             <Text strong style={{ marginBottom: 0 }}>{source.title}</Text>

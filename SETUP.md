@@ -18,18 +18,25 @@ cp .env.example .env
 
 编辑 `.env` 文件，填入必要的配置：
 ```bash
-# LLM 配置（默认使用 DashScope 的 OpenAI 兼容接口）
+# LLM 配置（RAG / 普通问答常用：DashScope 的 OpenAI 兼容接口）
 DASHSCOPE_API_KEY=your_dashscope_api_key_here
+
+# 病历分析（多 Agent）默认使用 DeepSeek；请至少配置密钥（否则 Agent 模式会调不通）
+DEEPSEEK_API_KEY=your_deepseek_api_key_here
+# DEEPSEEK_API_BASE=https://api.deepseek.com
+
+# 病历分析：请求未传 model_provider 时的默认提供方（deepseek | qwen，默认 deepseek）
+# AGENT_DEFAULT_LLM_PROVIDER=deepseek
+
+# 按角色覆盖 Agent 使用的模型（可选；不配则 DeepSeek 下统一 deepseek-chat）
+# AGENT_MODEL_ANALYST=deepseek-chat
+# AGENT_MODEL_PLANNER=deepseek-chat
 
 # LangSmith（可选，用于可观测性/Tracing）
 # 说明：Node 后端与 Python 服务都会读取这些环境变量；启用后可在 LangSmith UI 查看全链路 trace。
 LANGSMITH_TRACING_V2=true
 LANGSMITH_API_KEY=your_langsmith_api_key_here
 LANGSMITH_PROJECT=medical-ai
-
-# 也支持 DeepSeek（优先级：DEEPSEEK_* > DASHSCOPE_*）
-# DEEPSEEK_API_KEY=your_deepseek_api_key_here
-# DEEPSEEK_API_BASE=https://api.deepseek.com
 
 # Neo4j密码
 NEO4J_PASSWORD=medical_demo_2025
@@ -111,6 +118,7 @@ pnpm run dev
 - 鉴别诊断建议
 - 展示 AI 推理过程（SSE：`thinking` / `intent` / `agent_step` / `sources` / `result` / `done`）
 - **详细分析**（仅病历分析 Tab）：打开后走 `agent_pipeline=full`（分角色多轮 LLM，更细但更慢）；关闭为默认 `fast`（合并步骤，更快）
+- **默认大模型**：Python 侧在未传 `model_provider` 时默认 **DeepSeek**，各角色在 DeepSeek 下统一 **`deepseek-chat`**；需要整条 Agent 链路用 Qwen 时，请在请求中传 `model_provider: "qwen"`，或设置 `AGENT_DEFAULT_LLM_PROVIDER=qwen`（详见 `docs/design.md` 与 `README.md`）
 
 ## 注意事项
 

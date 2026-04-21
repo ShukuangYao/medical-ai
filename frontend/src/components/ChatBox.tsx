@@ -85,13 +85,11 @@ function ChatBox({ mode }: ChatBoxProps) {
   const modelOptions = useMemo(() => {
     if (modelProvider === 'qwen') {
       return [
-        { value: 'qwen-turbo', label: 'qwen-turbo' },
-        { value: 'qwen-plus', label: 'qwen-plus' },
-        { value: 'qwen-max', label: 'qwen-max' },
+        { value: 'qwen3.5-flash', label: 'qwen3.5-flash' },
+        { value: 'qwen3.5-plus', label: 'qwen3.5-plus' },
       ] as Array<{ value: ModelName; label: string }>
     }
     return [
-      { value: 'deepseek-reasoner', label: 'deepseek-reasoner' },
       { value: 'deepseek-chat', label: 'deepseek-chat' },
     ] as Array<{ value: ModelName; label: string }>
   }, [modelProvider])
@@ -108,25 +106,28 @@ function ChatBox({ mode }: ChatBoxProps) {
       clearInterval(typewriterTimerRef.current)
       typewriterTimerRef.current = null
     }
-    if (flush && tokenQueueRef.current.length > 0) {
-      streamContentRef.current += tokenQueueRef.current.join('')
-      tokenQueueRef.current = []
+    if (flush) {
+      if (tokenQueueRef.current.length > 0) {
+        streamContentRef.current += tokenQueueRef.current.join('')
+        tokenQueueRef.current = []
+      }
       useChatStore
         .getState()
         .updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, assistantMsgIdRef.current, (msg) => ({
           ...msg,
           content: streamContentRef.current,
+          typewriterDone: true,
         }))
     }
     isDoneRef.current = false
   }, [])
 
-  // 启动打字机：30ms/tick，每次出队 3 个字符；队列耗尽且流结束时自动终止
+  // 启动打字机：20ms/tick，每次出队 10 个字符；队列耗尽且流结束时自动终止
   const startTypewriter = useCallback(() => {
     if (typewriterTimerRef.current) return
     typewriterTimerRef.current = setInterval(() => {
       if (tokenQueueRef.current.length > 0) {
-        const chars = tokenQueueRef.current.splice(0, 3).join('')
+        const chars = tokenQueueRef.current.splice(0, 10).join('')
         streamContentRef.current += chars
         useChatStore
           .getState()
@@ -143,11 +144,12 @@ function ChatBox({ mode }: ChatBoxProps) {
           .updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, assistantMsgIdRef.current, (msg) => ({
             ...msg,
             thinkingExpanded: false,
+            typewriterDone: true,
           }))
         useChatStore.getState().setLoadingForMode(requestModeRef.current, false)
         useChatStore.getState().checkAndSummarizeForMode(requestModeRef.current)
       }
-    }, 30)
+    }, 20)
   }, [])
 
   // 用户点击停止：中断 SSE + flush 打字机队列
@@ -191,7 +193,14 @@ function ChatBox({ mode }: ChatBoxProps) {
       tokenQueueRef.current = []
       isDoneRef.current = false
       // 捕获 assistant 消息 ID，后续所有回调通过 ID 更新，跨 tab 安全
-      assistantMsgIdRef.current = addMessageForSession(m, sid, { role: 'assistant', content: '', thinkingSteps: [], thinkingExpanded: true })
+      assistantMsgIdRef.current = addMessageForSession(m, sid, {
+        role: 'assistant',
+        content: '',
+        thinkingSteps: [],
+        thinkingExpanded: true,
+        streaming: true,
+        typewriterDone: false,
+      })
       const aid = assistantMsgIdRef.current
       // 关键：agent 流式可能不返回 token（只返回事件/最终 result），此时若不启动打字机，
       // 收尾逻辑（loading=false）不会触发，导致输入框一直灰。
@@ -204,8 +213,7 @@ function ChatBox({ mode }: ChatBoxProps) {
           userId,
           useGraph: graphMode,
           chatHistory: contextHistory,
-          modelProvider,
-          modelName,
+          ...(m === 'rag' ? { modelProvider, modelName } : {}),
           agentPipeline,
         },
         {
@@ -247,11 +255,26 @@ function ChatBox({ mode }: ChatBoxProps) {
               content: report?.summary ?? msg.content,
             }))
           },
-          onDone: () => { isDoneRef.current = true; startTypewriter() },
+          onDone: () => {
+            isDoneRef.current = true
+            const queueEmpty = tokenQueueRef.current.length === 0
+            updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, aid, (msg) => ({
+              ...msg,
+              streaming: false,
+              // Keep typewriterDone=false until local queue is flushed; prevents Markdown tail-trim flicker.
+              typewriterDone: queueEmpty,
+            }))
+            if (queueEmpty) {
+              // No local typewriter backlog: finish UI immediately.
+              useChatStore.getState().setLoadingForMode(requestModeRef.current, false)
+              useChatStore.getState().checkAndSummarizeForMode(requestModeRef.current)
+            }
+            startTypewriter()
+          },
           onError: (error) => {
             stopTypewriter(true)
             message.error(`生成错误: ${error}`)
-            updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, assistantMsgIdRef.current, (msg) => ({ ...msg, thinkingExpanded: false }))
+            updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, assistantMsgIdRef.current, (msg) => ({ ...msg, thinkingExpanded: false, streaming: false }))
             setLoadingForMode(requestModeRef.current, false)
           },
           onRetry: (attempt, delayMs) =>
@@ -267,8 +290,7 @@ function ChatBox({ mode }: ChatBoxProps) {
         sessionId: sid,
         userId,
         useGraph: graphMode,
-        modelProvider,
-        modelName,
+        ...(m === 'rag' ? { modelProvider, modelName } : {}),
         agentPipeline,
       })
         .then((response) => {
@@ -332,26 +354,30 @@ function ChatBox({ mode }: ChatBoxProps) {
             <Switch size="small" checked={agentDetailMode} onChange={setAgentDetailMode} disabled={loading} />
           </>
         ) : null}
-        <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>模型</Text>
-        <Select
-          size="small"
-          value={modelProvider}
-          style={{ width: 110 }}
-          disabled={loading}
-          options={[
-            { value: 'qwen', label: 'Qwen' },
-            { value: 'deepseek', label: 'DeepSeek' },
-          ]}
-          onChange={(v) => setModelProvider(v as ModelProvider)}
-        />
-        <Select
-          size="small"
-          value={modelName}
-          style={{ width: 170 }}
-          disabled={loading}
-          options={modelOptions}
-          onChange={(v) => setModelName(v as ModelName)}
-        />
+        {mode === 'rag' ? (
+          <>
+            <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>模型</Text>
+            <Select
+              size="small"
+              value={modelProvider}
+              style={{ width: 110 }}
+              disabled={loading}
+              options={[
+                { value: 'qwen', label: 'Qwen' },
+                { value: 'deepseek', label: 'DeepSeek' },
+              ]}
+              onChange={(v) => setModelProvider(v as ModelProvider)}
+            />
+            <Select
+              size="small"
+              value={modelName}
+              style={{ width: 170 }}
+              disabled={loading}
+              options={modelOptions}
+              onChange={(v) => setModelName(v as ModelName)}
+            />
+          </>
+        ) : null}
         {messages.length > 0 && (
           <Text type="secondary" style={{ fontSize: 11, marginLeft: 'auto' }}>
             {messages.filter((m) => m.role === 'user').length} 轮对话

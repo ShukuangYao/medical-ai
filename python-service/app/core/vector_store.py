@@ -119,6 +119,8 @@ class VectorStoreMilvusClient:
             param={"metric_type": "IP", "params": {"nprobe": 16}},
             limit=k,
             output_fields=["text", "title", "source", "page"]
+            ,
+            timeout=float(getattr(settings, "MILVUS_SEARCH_TIMEOUT_S", 2.5)),
         )
 
         docs = []

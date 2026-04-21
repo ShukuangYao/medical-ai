@@ -41,7 +41,8 @@ cp .env.docker.example .env
 
 1. 编辑 `.env`，至少填好：
 
-- `DASHSCOPE_API_KEY`（默认 LLM 配置使用 DashScope 的 OpenAI 兼容接口）
+- `DASHSCOPE_API_KEY`（**RAG / 普通问答**等仍可用 DashScope 的 OpenAI 兼容接口）
+- `DEEPSEEK_API_KEY`（**病历分析（多 Agent）**默认走 DeepSeek；未配置会导致 Agent 调用失败）
 - `NEO4J_PASSWORD`（供 compose 内的 neo4j 使用）
 
 （可选）启用 LangSmith Tracing（全链路可观测性）：在 `.env` 中加入
@@ -123,6 +124,7 @@ pnpm dev
 - **输入**：病历文本/症状描述（文字）
 - **输出**：结构化病历分析报告（`report`，严格 JSON）+ 简短总结（`answer`/`report.summary`）+（可选）推理过程（`trace`）
 - **流式输出**：支持 SSE 流式（`thinking / intent / agent_step / sources / result / done`），前端会实时更新“思考过程”，并在 `result` 到达后渲染结构化卡片。
+- **默认大模型**：请求未传 `model_provider` 时，Python 侧默认 **`deepseek`**；在 DeepSeek 下各 Agent 角色统一使用 **`deepseek-chat`**（可通过 `AGENT_MODEL_*` 环境变量按角色覆盖）。若需整条链路仍用 Qwen，请在请求中显式传 `model_provider: "qwen"`，或设置环境变量 `AGENT_DEFAULT_LLM_PROVIDER=qwen`。
 
 #### 快速模式 vs 详细模式（多 Agent 仍在）
 
@@ -217,7 +219,7 @@ sequenceDiagram
   B->>F: 输入病历文本
   F->>N: POST /api/chat/stream {mode:agent,message,...}
   N->>P: POST /api/agent/stream
-  P->>A: diagnose_stream(message,session_id,agent_pipeline)
+  P->>A: diagnose_stream(message,session_id,model_provider,model_name,agent_pipeline)
   A-->>P: SSE data: {type:thinking/intent/agent_step/sources/result/done}
   P-->>N: SSE转发
   N-->>F: SSE转发
@@ -305,7 +307,11 @@ RAG 可能会降级走 **Elasticsearch** 或其它检索来源；是否可用取
 - **LLM（OpenAI 兼容接口）**：Python 侧通过以下环境变量连接（见 `python-service/app/config.py`）：
   - `DASHSCOPE_API_KEY`: OpenAI 兼容接口的 `api_key`
   - `LLM_API_BASE`: OpenAI 兼容接口的 `base_url`（如 DashScope 兼容地址、OneAPI 地址、本地 vLLM/ollama 的兼容地址）
-  - `LLM_MODEL`: 模型名（默认 `qwen-turbo`）
+  - `LLM_MODEL`: 模型名（默认 `qwen3.5-flash`；主要用于 **RAG** 等 Qwen 路径）
+  - `DEEPSEEK_API_KEY` / `DEEPSEEK_API_BASE`: **病历分析（Agent）** 默认提供方
+  - `AGENT_DEFAULT_LLM_PROVIDER`: 病历分析在请求未带 `model_provider` 时的默认提供方，可选 `deepseek`（默认）或 `qwen`
+  - `AGENT_MODEL_VALIDATOR`、`AGENT_MODEL_EXTRACTOR`、`AGENT_MODEL_ANALYST`、`AGENT_MODEL_TRIAGE_DEPT`、`AGENT_MODEL_PLANNER`、`AGENT_MODEL_COORDINATOR` 等：按角色覆盖模型 id（仍优先于默认的 `deepseek-chat`；完整列表见 `docs/design.md`）
+- **LangSmith**：启用后，Python 侧 LLM 子 run 的 **name** 会包含模型 id（如 `openai_chat_completions:deepseek-chat`、`RecordValidator:deepseek:deepseek-chat`），便于在 Traces 列表中区分；详见 `docs/design.md`。
 - **依赖服务（Python 侧）**：Milvus / Elasticsearch / Neo4j / Redis 的地址通常通过环境变量读取；参考：
   - `medical-ai/.env.example`
   - `medical-ai/docker-compose.yml`
@@ -317,6 +323,8 @@ RAG 可能会降级走 **Elasticsearch** 或其它检索来源；是否可用取
 - **前端卡片展示**：病历分析结果会以卡片展示（紧急程度/科室/下一步举措），并保留过程日志与 sources。
 - **病历分析快速/详细**：支持 `agent_pipeline`（`fast` | `full`）；前端病历分析 Tab 提供「详细分析」开关；非流式请求前端超时已放宽，避免长分析被误判失败。
 - **Neo4j（Compose）**：数据使用命名卷 `neo4j-data`；宿主机访问 HTTP `7475`、Bolt `7688`（避免与本机 Neo4j Desktop 默认端口冲突）。
+- **病历分析默认 LLM**：未传 `model_provider` 时默认 **DeepSeek**；各角色在 DeepSeek 下统一 **`deepseek-chat`**（`AGENT_DEFAULT_LLM_PROVIDER` / `AGENT_MODEL_*` 可覆盖）；意图识别与本轮 `model_provider` 对齐。
+- **LangSmith**：Agent / RAG 的 LLM 子 span 命名包含 **provider + model**，便于在 Traces 中区分（Node 侧根 trace 亦可带动态 name/metadata）。
 
 ## 会话（Sessions）
 

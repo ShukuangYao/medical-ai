@@ -104,16 +104,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
   messagesBySession: { rag: {}, agent: {} },
 
   modelProvider: (localStorage.getItem('medicalai.modelProvider') as ModelProvider) || 'qwen',
-  modelName: (localStorage.getItem('medicalai.modelName') as ModelName) || 'qwen-turbo',
+  modelName: (localStorage.getItem('medicalai.modelName') as ModelName) || 'qwen3.5-flash',
 
   setModelProvider: (provider) => {
     set({ modelProvider: provider })
     localStorage.setItem('medicalai.modelProvider', provider)
     // provider 变更时，若当前 model 不属于该 provider，则切到默认
     const { modelName } = get()
-    const nextDefault: ModelName = provider === 'qwen' ? 'qwen-turbo' : 'deepseek-chat'
-    const qwenModels = new Set<ModelName>(['qwen-turbo', 'qwen-plus', 'qwen-max'])
-    const deepseekModels = new Set<ModelName>(['deepseek-reasoner', 'deepseek-chat'])
+    const nextDefault: ModelName = provider === 'qwen' ? 'qwen3.5-flash' : 'deepseek-chat'
+    const qwenModels = new Set<ModelName>(['qwen3.5-flash', 'qwen3.5-plus'])
+    const deepseekModels = new Set<ModelName>(['deepseek-chat'])
     const ok = provider === 'qwen' ? qwenModels.has(modelName) : deepseekModels.has(modelName)
     if (!ok) get().setModelName(nextDefault)
   },

@@ -1,9 +1,17 @@
 """意图路由器 - 根据意图分发到不同处理器"""
-from typing import Dict, List, Optional, AsyncGenerator
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Tuple
+import hashlib
+import time
+
+from app.config import settings
 from app.core.graph_querier import GraphQuerier
 from app.core.retriever import ParentRetriever
 from app.core.reranker import BGEReranker
 from app.core.llm_client import OpenAILLM
+from app.core.tools.base import ToolContext
+from app.core.tools.executor import ToolExecutor
 
 
 class IntentRouter:
@@ -15,11 +23,108 @@ class IntentRouter:
         retriever: ParentRetriever,
         reranker: BGEReranker,
         llm: OpenAILLM,
+        tool_executor: Optional[ToolExecutor] = None,
     ):
         self.graph_querier = graph_querier
         self.retriever = retriever
         self.reranker = reranker
         self.llm = llm
+        self.tools = tool_executor
+        # In-process cache for expensive rerank calls (RAG). key -> (ts, docs)
+        self._rerank_cache: Dict[str, Tuple[float, List[Dict]]] = {}
+
+    @staticmethod
+    def _doc_id(doc: Dict) -> str:
+        return str(doc.get("id") or doc.get("doc_id") or doc.get("source_id") or doc.get("text", "")[:80])
+
+    def _rerank_cache_key(self, *, query: str, docs: List[Dict], top_k: int) -> str:
+        # Make key robust to doc ordering jitter across retrieval calls.
+        ids = sorted([self._doc_id(d) for d in docs])[:200]
+        payload = f"{query}\n{top_k}\n" + "\n".join(ids)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _prefilter_rerank_candidates(self, docs: List[Dict], *, max_n: int) -> List[Dict]:
+        """Reduce rerank candidates using cheap heuristics (score/source)."""
+        if max_n <= 0 or len(docs) <= max_n:
+            return docs
+
+        def score_key(d: Dict) -> float:
+            # prefer already-scored results; default 0
+            v = d.get("score")
+            try:
+                return float(v) if v is not None else 0.0
+            except Exception:
+                return 0.0
+
+        # Keep a bit more from each source if present; otherwise just top by score.
+        by_source: Dict[str, List[Dict]] = {}
+        for d in docs:
+            src = str(d.get("retrieval_source") or "unknown")
+            by_source.setdefault(src, []).append(d)
+        for src, arr in by_source.items():
+            arr.sort(key=score_key, reverse=True)
+
+        picked: List[Dict] = []
+        # Prefer graph docs if any (they typically are high precision)
+        if "graph" in by_source:
+            picked.extend(by_source["graph"][: min(6, max_n)])
+
+        # Then take from vector/ES, proportional-ish
+        for src in ("vector", "elasticsearch", "unknown"):
+            if src in by_source and len(picked) < max_n:
+                remaining = max_n - len(picked)
+                take = min(remaining, max(4, remaining))
+                picked.extend(by_source[src][:take])
+
+        # If still short, fill from global top-by-score
+        if len(picked) < max_n:
+            rest = [d for d in docs if d not in picked]
+            rest.sort(key=score_key, reverse=True)
+            picked.extend(rest[: max_n - len(picked)])
+
+        # De-dup by id
+        seen = set()
+        out: List[Dict] = []
+        for d in picked:
+            i = self._doc_id(d)
+            if i in seen:
+                continue
+            seen.add(i)
+            out.append(d)
+            if len(out) >= max_n:
+                break
+        return out
+
+    async def _maybe_rerank(self, *, query: str, docs: List[Dict], top_k: int) -> List[Dict]:
+        if not docs:
+            return []
+        if len(docs) <= top_k:
+            return docs
+        # Prefilter to bound expensive rerank
+        max_n = int(getattr(settings, "RAG_RERANK_CANDIDATES_MAX", 24))
+        candidates = self._prefilter_rerank_candidates(docs, max_n=max_n)
+
+        ttl = float(getattr(settings, "RAG_RERANK_CACHE_TTL_S", 120.0))
+        key = self._rerank_cache_key(query=query, docs=candidates, top_k=top_k)
+        now = time.time()
+        cached = self._rerank_cache.get(key)
+        if cached and (now - float(cached[0])) <= ttl:
+            return cached[1]
+
+        if self.tools is not None:
+            out = await self.tools.run(
+                "rerank",
+                args={"query": query, "docs": candidates, "top_k": top_k},
+                ctx=ToolContext(mode="rag"),
+                trace_inputs={"query": query, "docs_count": len(candidates), "top_k": top_k, "cached": False},
+            )
+        else:
+            out = self.reranker.rerank(query, candidates, top_k=top_k)
+        try:
+            self._rerank_cache[key] = (now, out)
+        except Exception:
+            pass
+        return out
 
     async def route(
         self, intent_result: Dict, question: str, graph_enabled: bool = True
@@ -77,7 +182,15 @@ class IntentRouter:
 
         # 图谱查询
         if self.graph_querier and entity:
-            graph_docs = self.graph_querier.query(intent, entity)
+            if self.tools is not None:
+                graph_docs = await self.tools.run(
+                    "graph_query",
+                    args={"intent": intent, "entity": entity},
+                    ctx=ToolContext(mode="rag"),
+                    trace_inputs={"intent": intent, "entity": entity},
+                )
+            else:
+                graph_docs = self.graph_querier.query(intent, entity)
             all_docs.extend(graph_docs)
             print(
                 f"[IntentRouter] neo4j query done: intent={intent}, "
@@ -86,7 +199,15 @@ class IntentRouter:
 
         # 向量检索补充
         print("[IntentRouter] supplement retrieval: vector+ES only (skip graph duplicate)")
-        vector_docs = await self.retriever.retrieve(question)
+        if self.tools is not None:
+            vector_docs = await self.tools.run(
+                "hybrid_retrieve",
+                args={"query": question},
+                ctx=ToolContext(mode="rag"),
+                trace_inputs={"query": question},
+            )
+        else:
+            vector_docs = await self.retriever.retrieve(question)
         all_docs.extend(vector_docs)
         print(f"[IntentRouter] vector/es supplement docs={len(vector_docs)}")
 
@@ -110,7 +231,7 @@ class IntentRouter:
             if d.get("id", d.get("text", "")[:50]) not in graph_ids
         ]
         if len(supplement_docs) > 3:
-            supplement_docs = self.reranker.rerank(question, supplement_docs)
+            supplement_docs = await self._maybe_rerank(query=question, docs=supplement_docs, top_k=10)
         final_docs = graph_kept + supplement_docs
 
         graph_count = sum(1 for d in final_docs if d.get("retrieval_source") == "graph")
@@ -125,7 +246,15 @@ class IntentRouter:
 
     async def _hybrid_retrieve(self, question: str) -> List[Dict]:
         """混合检索：向量+ES+重排序"""
-        docs = await self.retriever.retrieve(question)
+        if self.tools is not None:
+            docs = await self.tools.run(
+                "hybrid_retrieve",
+                args={"query": question},
+                ctx=ToolContext(mode="rag"),
+                trace_inputs={"query": question},
+            )
+        else:
+            docs = await self.retriever.retrieve(question)
         if len(docs) > 3:
-            docs = self.reranker.rerank(question, docs)
+            docs = await self._maybe_rerank(query=question, docs=docs, top_k=10)
         return docs[:10]

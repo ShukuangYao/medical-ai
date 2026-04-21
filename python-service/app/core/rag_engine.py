@@ -9,6 +9,8 @@
 6. 结果处理
 """
 import os
+import json
+import hashlib
 import time
 import tiktoken
 from typing import Dict, List, Optional, AsyncGenerator
@@ -31,6 +33,10 @@ from app.core.session_store import SessionStore
 from app.core.context_builder import ContextBuilder
 from app.core.telemetry import Telemetry
 from app.core.ls_timing import now_utc, perf_ms_since, span_times
+from app.core.tools.base import ToolContext, ToolError
+from app.core.tools.executor import ToolExecutor
+from app.core.tools.registry import ToolRegistry
+from app.core.tools.impl import GraphQueryTool, HybridRetrieveTool, RerankTool, RewriteQuestionTool
 
 from langsmith import RunTree
 from langsmith.run_helpers import get_current_run_tree, tracing_context
@@ -53,6 +59,7 @@ class LocalDocQA:
         self.graph_querier: Optional[GraphQuerier] = None
         self.intent_classifier: Optional[HybridIntentClassifier] = None
         self.intent_router: Optional[IntentRouter] = None
+        self.tools: Optional[ToolExecutor] = None
         self.memory_manager: Optional[MemoryManager] = None
         self.context_resolver: Optional[ContextResolver] = None
         self.session_store: Optional[SessionStore] = None
@@ -117,11 +124,19 @@ class LocalDocQA:
 
         # 9. 初始化意图识别器和路由器
         self.intent_classifier = HybridIntentClassifier(llm=self.llm)
+        # Tool registry/executor: unify validation/error codes/trace spans for retrieval sub-steps.
+        reg = ToolRegistry()
+        reg.register(HybridRetrieveTool(self.retriever))
+        reg.register(RerankTool(self.reranker))
+        reg.register(GraphQueryTool(self.graph_querier))
+        reg.register(RewriteQuestionTool(self.rewrite_chain))
+        self.tools = ToolExecutor(registry=reg)
         self.intent_router = IntentRouter(
             graph_querier=self.graph_querier,
             retriever=self.retriever,
             reranker=self.reranker,
             llm=self.llm,
+            tool_executor=self.tools,
         )
 
         # 10. 初始化记忆管理器
@@ -427,19 +442,32 @@ class LocalDocQA:
                     if emit_thinking:
                         yield _thinking("🔄 正在优化问题表述...")
                     tel.start("rewrite")
-                    _rw_start, rw_t0 = span_times()
-                    rw_span = run.create_child(
-                        name="rewrite",
-                        run_type="tool",
-                        inputs={"question": question, "chat_history": chat_history},
-                    )
-                    rw_span.post()
-                    rewritten_question = await self.rewrite_chain.rewrite(question, chat_history)
-                    rw_span.end(
-                        outputs={"rewritten_question": rewritten_question, "duration_ms": perf_ms_since(rw_t0)},
-                        metadata={"duration_ms": perf_ms_since(rw_t0)},
-                    )
-                    rw_span.patch()
+                    try:
+                        hist_sig = ""
+                        try:
+                            tail = (chat_history or [])[-6:]
+                            hist_sig = hashlib.sha256(
+                                json.dumps(tail, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                            ).hexdigest()[:12]
+                        except Exception:
+                            hist_sig = ""
+                        rewritten_question = await self.tools.run(
+                            "rewrite_question",
+                            args={"question": question, "chat_history": chat_history},
+                            ctx=ToolContext(
+                                user_id=str(user_id or ""),
+                                session_id=str(session_id or ""),
+                                mode="rag",
+                            ),
+                            trace_inputs={"question": question, "chat_history_len": len(chat_history or [])},
+                            # Do NOT key by session_id; users can ask the same question in a new session.
+                            idempotency_key=f"rewrite:{str(user_id or '')}:{hist_sig}:{question}",
+                            idempotency_ttl_s=float(getattr(settings, "RAG_REWRITE_CACHE_TTL_S", 120.0)),
+                        )
+                    except ToolError as e:
+                        # Keep compatibility: error content remains string; add code/retriable for clients that read it.
+                        yield {"type": "error", "content": e.message, **e.to_event_fields()}
+                        rewritten_question = question
                     rw_evt = tel.end("rewrite")
                     if emit_thinking and rw_evt:
                         yield _thinking(f"⏱️ rewrite: {rw_evt['duration_ms']}ms")
@@ -462,22 +490,15 @@ class LocalDocQA:
                         yield _thinking("🔍 正在检索相关文档...")
 
                 _route_start, route_t0 = span_times()
-                route_span = run.create_child(
-                    name="retrieve_and_rerank",
-                    run_type="retriever",
-                    inputs={"intent": intent_result, "query": rewritten_question, "graph_enabled": use_graph},
-                )
-                route_span.post()
-                reranked, _route_strategy = await self.intent_router.route(
-                    intent_result,
-                    rewritten_question,
-                    graph_enabled=use_graph,
-                )
-                route_span.end(
-                    outputs={"docs": reranked or [], "route_strategy": _route_strategy, "duration_ms": perf_ms_since(route_t0)},
-                    metadata={"duration_ms": perf_ms_since(route_t0)},
-                )
-                route_span.patch()
+                try:
+                    reranked, _route_strategy = await self.intent_router.route(
+                        intent_result,
+                        rewritten_question,
+                        graph_enabled=use_graph,
+                    )
+                except ToolError as e:
+                    yield {"type": "error", "content": e.message, **e.to_event_fields()}
+                    reranked, _route_strategy = [], "tool_error"
 
                 if emit_thinking:
                     if reranked:
@@ -521,21 +542,33 @@ class LocalDocQA:
                 # 步骤5：流式生成回答
                 llm = OpenAILLM.from_provider(provider=model_provider, model_name=model_name)
                 messages = llm.build_rag_messages(question, context, chat_history)
+                # Some "reasoner" models may stream only reasoning fields and produce empty visible content.
+                # For RAG user-visible streaming, prefer a chat model that reliably streams `content`.
+                stream_llm = llm
+                try:
+                    if (model_provider or "").lower() == "deepseek" and (
+                        "r1" in (llm.model or "").lower()
+                    ):
+                        stream_llm = OpenAILLM.from_provider(provider="deepseek", model_name="deepseek-chat")
+                        if emit_thinking:
+                            yield _thinking("⚠️ 当前模型流式可能不返回正文，已自动切换为 deepseek-chat 进行流式输出")
+                except Exception:
+                    stream_llm = llm
                 first_token = True
                 tel.start("llm_stream")
                 _llm_start, llm_t0 = span_times()
                 llm_span = run.create_child(
-                    name="llm_stream",
+                    name=f"llm_stream:{stream_llm.model}",
                     run_type="llm",
                     inputs={
-                        "model": llm.model,
+                        "model": stream_llm.model,
                         "messages": messages,
                         "temperature": 0.7,
                         "max_tokens": settings.MAX_OUTPUT_TOKENS,
                     },
                 )
                 llm_span.post()
-                async for token in llm.generate_stream(messages):
+                async for token in stream_llm.generate_stream(messages):
                     if first_token:
                         first_token = False
                         first_token_seen_at = time.perf_counter()
@@ -553,7 +586,8 @@ class LocalDocQA:
                         # fall back to a chat model to produce the final answer text (without reasoning).
                         fallback_llm = llm
                         try:
-                            if (model_provider or "").lower() == "deepseek" and "reasoner" in (llm.model or ""):
+                            m = (llm.model or "")
+                            if (model_provider or "").lower() == "deepseek" and ("r1" in m.lower()):
                                 fallback_llm = OpenAILLM.from_provider(provider="deepseek", model_name="deepseek-chat")
                         except Exception:
                             fallback_llm = llm
@@ -571,6 +605,14 @@ class LocalDocQA:
                     except Exception:
                         # If fallback fails, keep empty answer; caller will handle downstream.
                         pass
+                # Final guardrail: never leave SSE clients with an empty visible answer.
+                if not full_answer.strip():
+                    hint = (
+                        "（当前模型可能只返回推理内容而未返回可见正文，或回退生成失败。\n"
+                        "可尝试切换为 `deepseek-chat` 或 `qwen3.5-flash` 再试。）"
+                    )
+                    full_answer = hint
+                    yield {"type": "token", "content": full_answer}
                 llm_span.end(
                     outputs={
                         "answer": full_answer,

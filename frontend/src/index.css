@@ -22,14 +22,45 @@ body {
   padding: 0;
   line-height: 1.35; /* tighter than 1.7 */
   list-style-position: outside;
+  list-style: none; /* disable native ::marker; we draw our own */
+  /* Parent chat paragraphs use `white-space: pre-wrap`; inside lists we want normal flow,
+     otherwise markdown newlines between inline nodes still force line breaks. */
+  white-space: normal;
 }
 
 .md-li {
   margin: 1px 0;
+  position: relative;
+  padding-left: 2.0em; /* marker column */
+  white-space: normal;
 }
 
 .md-unordered {
-  list-style-type: disc;
+  list-style: none;
+}
+
+/* Markdown renderer often wraps list item content in <p>; remove its margins */
+.md-li > p,
+.md-li > .md-p {
+  margin: 0 !important; /* override inline style from renderer */
+  display: inline !important; /* keep number + text on same line */
+}
+
+/* If a list item contains multiple paragraphs (e.g. "1" then text), join them with a space. */
+.md-li > p + p::before,
+.md-li > .md-p + .md-p::before {
+  content: " ";
+}
+
+/* Unordered marker (bullet) */
+.md-unordered > li.md-li::before {
+  content: "•";
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1.6em;
+  text-align: right;
+  color: rgba(0, 0, 0, 0.65);
 }
 
 /* Render ordered lists as ul + CSS counter numbering */
@@ -40,13 +71,23 @@ body {
 
 .md-ordered > li {
   counter-increment: mditem;
-  position: relative;
-  padding-left: 1.4em; /* room for "10." */
 }
 
-.md-ordered > li::before {
-  content: counter(mditem) ". ";
+/* Ordered marker: generate pure number (no "." / "。") */
+.md-ordered > li.md-li::before {
+  content: counter(mditem) " ";
   position: absolute;
   left: 0;
+  top: 0;
+  width: 1.6em;
+  text-align: right;
   color: rgba(0, 0, 0, 0.65);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Nested lists: normal block flow + reasonable indentation */
+.md-li > ul.md-list {
+  margin-top: 4px;
+  margin-left: 18px;
+  margin-bottom: 0;
 }

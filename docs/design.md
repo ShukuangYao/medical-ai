@@ -72,8 +72,9 @@ flowchart TB
   - `message: str`
   - `use_graph?: bool`
   - `chat_history?: List[{role, content, ...}]`
-  - `model_provider?: 'qwen'|'deepseek'`
-  - `model_name?: str`
+  - `model_provider?: 'qwen'|'deepseek'`（**病历分析 Agent**：未传或非法值时由服务端默认 `AGENT_DEFAULT_LLM_PROVIDER`，默认 **`deepseek`**；**RAG** 仍按请求与既有逻辑选择提供方）
+  - `model_name?: str`（DeepSeek 下多 Agent 默认各角色 **`deepseek-chat`**；可被 `AGENT_MODEL_*` 环境变量按角色覆盖）
+  - `agent_pipeline?: 'fast'|'full'`
 - `ChatResponse`：
   - `answer: str`
   - `sources?: List[Source]`
@@ -212,7 +213,7 @@ sequenceDiagram
   F->>N: POST /api/chat/stream {mode:agent,...}
   N-->>F: SSE session(event)
   N->>P: POST /api/agent/stream
-  P->>A: diagnose_stream(user_id,session_id)
+  P->>A: diagnose_stream(..., model_provider, model_name, agent_pipeline)
   A-->>P: SSE thinking/intent/agent_step/sources/result/done
   P-->>N: SSE转发
   N-->>F: SSE转发
@@ -285,6 +286,21 @@ sequenceDiagram
 - **最小上下文工程**：
   - 从 SQLite 恢复最近少量 agent 历史，形成 `history_brief`，用于减少重复询问/漂移
 
+### LLM 提供方与模型（Agent）
+
+- **默认提供方**：`diagnose_stream` 在请求未带合法 `model_provider` 时使用 `settings.AGENT_DEFAULT_LLM_PROVIDER`（环境变量 **`AGENT_DEFAULT_LLM_PROVIDER`**，默认 **`deepseek`**）。显式传 `qwen` / `deepseek` 时以请求为准。
+- **DeepSeek 下的统一模型**：`provider == deepseek` 时，各 AutoGen 角色共用 **`model_name` 或默认 `deepseek-chat`**（不再对部分角色单独切 `deepseek-reasoner`）。
+- **按角色覆盖**：仍可通过 `AGENT_PROVIDER_*` / `AGENT_MODEL_*`（如 `AGENT_MODEL_ANALYST`）覆盖对应 `ConversableAgent` 的 `llm_config`（优先级高于上述默认）。
+- **意图识别**：与本轮解析后的 `model_provider` / `model_name` 一致，使用 `OpenAILLM.from_provider` + `HybridIntentClassifier`，避免 Agent 主体已切 DeepSeek 而 intent 仍固定 Qwen。
+
+### LangSmith（Agent / LLM 子 run）
+
+- **根链**：如 `python_agent`、`http_agent_stream`；Node 侧可对根 run 使用动态 `name` / `tags` / `metadata`（便于列表筛选）。
+- **LLM 子 span**：
+  - `llm_client`：`openai_chat_completions:{model}` / `openai_chat_completions_stream:{model}`
+  - `rag_engine` 流式生成：`llm_stream:{model}`
+  - `agent_orchestrator`：各阶段 LLM span 形如 **`{Role}:{provider_guess}:{model}`**（`inputs` 中含 `model` / `provider_guess` / `base_url`），列表视图即可区分模型。
+
 ## 会话与持久化设计
 
 来源：`python-service/app/core/session_store.py`、`python-service/app/routers/sessions.py`
@@ -316,8 +332,10 @@ sequenceDiagram
 来源：`medical-ai/.env.example`、`python-service/app/config.py`
 
 - **LLM**：
-  - `DASHSCOPE_API_KEY`, `LLM_API_BASE`, `LLM_MODEL`
-  - `DEEPSEEK_API_KEY`, `DEEPSEEK_API_BASE`
+  - `DASHSCOPE_API_KEY`, `LLM_API_BASE`, `LLM_MODEL`（RAG / Qwen 路径常用）
+  - `DEEPSEEK_API_KEY`, `DEEPSEEK_API_BASE`（病历分析 Agent 默认提供方）
+  - `AGENT_DEFAULT_LLM_PROVIDER`：`qwen` | `deepseek`（默认 **`deepseek`**；仅影响「请求未指定 `model_provider`」时的 Agent 默认）
+  - `AGENT_MODEL_VALIDATOR`, `AGENT_MODEL_EXTRACTOR`, `AGENT_MODEL_ANALYST`, `AGENT_MODEL_TRIAGE_DEPT`, `AGENT_MODEL_PLANNER`, `AGENT_MODEL_COORDINATOR`：按角色覆盖模型 id（可选）
 - **RAG stores**：
   - Milvus：`MILVUS_HOST`, `MILVUS_PORT`, `MILVUS_COLLECTION`
   - ES：`ES_HOST`, `ES_PORT`, `ES_INDEX`

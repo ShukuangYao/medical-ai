@@ -37,11 +37,22 @@ class OpenAILLM:
         - qwen: uses DASHSCOPE_API_KEY + LLM_API_BASE
         - deepseek: uses DEEPSEEK_API_KEY + DEEPSEEK_API_BASE
         """
+        def _normalize_model_id(p: str, m: Optional[str]) -> Optional[str]:
+            mm = (m or "").strip()
+            if not mm:
+                return m
+            if p == "deepseek":
+                # DeepSeek official OpenAI-compatible API uses stable ids like `deepseek-chat`.
+                # Some UIs/configs may pass non-stable names. Map to a supported id.
+                if mm.lower() in {"deepseek-chat"}:
+                    return "deepseek-chat"
+            return m
+
         p = provider or "qwen"
         if p == "deepseek":
             api_key = settings.DEEPSEEK_API_KEY or settings.DASHSCOPE_API_KEY
             base_url = settings.DEEPSEEK_API_BASE
-            model = model_name or "deepseek-chat"
+            model = _normalize_model_id(p, model_name) or "deepseek-chat"
         else:
             api_key = settings.DASHSCOPE_API_KEY
             base_url = settings.LLM_API_BASE
@@ -62,7 +73,7 @@ class OpenAILLM:
         span = None
         if parent is not None:
             span = parent.create_child(
-                name=f"openai_chat_completions{_LANGSMITH_SPAN_SUFFIX}",
+                name=f"openai_chat_completions:{m}{_LANGSMITH_SPAN_SUFFIX}",
                 run_type="llm",
                 inputs={
                     "model": m,
@@ -120,7 +131,7 @@ class OpenAILLM:
         span = None
         if parent is not None:
             span = parent.create_child(
-                name=f"openai_chat_completions_stream{_LANGSMITH_SPAN_SUFFIX}",
+                name=f"openai_chat_completions_stream:{m}{_LANGSMITH_SPAN_SUFFIX}",
                 run_type="llm",
                 inputs={
                     "model": m,
