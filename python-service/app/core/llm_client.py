@@ -11,6 +11,7 @@ from app.config import settings
 from app.core.context_builder import ContextBuilder
 from app.core.ls_timing import now_utc, perf_ms_since, span_times
 from app.core.run_cancel import is_cancelled as run_cancelled
+from app.core.metrics import inc_cancel, inc_llm_retry, inc_llm_failure
 
 from langsmith.run_helpers import get_current_run_tree
 
@@ -158,6 +159,12 @@ class OpenAILLM:
                         raise
                     if _cancel_requested(cancel_run_id):
                         raise LLMRunCancelled("cancelled")
+                    # Observability (Phase 3): count retry attempts
+                    try:
+                        bu = str(getattr(self.client, "base_url", "") or "")
+                        inc_llm_retry("deepseek" if "deepseek" in bu else ("qwen" if bu else "unknown"))
+                    except Exception:
+                        pass
                     await _llm_http_backoff(attempt)
             if response is None:
                 raise last_exc if last_exc else RuntimeError("LLM chat.completions failed")
@@ -176,6 +183,10 @@ class OpenAILLM:
                 span.patch()
             return text
         except LLMRunCancelled as e:
+            try:
+                inc_cancel("llm_cancel")
+            except Exception:
+                pass
             if span is not None:
                 span.end(
                     error="cancelled",
@@ -197,7 +208,26 @@ class OpenAILLM:
                 )
                 span.patch()
             raise e
-        except Exception:
+        except Exception as e:
+            # Non-cancel failures: count for monitoring.
+            try:
+                bu = str(getattr(self.client, "base_url", "") or "")
+                inc_llm_failure("deepseek" if "deepseek" in bu else ("qwen" if bu else "unknown"))
+            except Exception:
+                pass
+            if span is not None:
+                try:
+                    span.end(
+                        error=str(e),
+                        metadata={
+                            "build_id": _LANGSMITH_BUILD_ID,
+                            "duration_ms": perf_ms_since(t0_span),
+                            "llm_http_retries": attempt_used,
+                        },
+                    )
+                    span.patch()
+                except Exception:
+                    pass
             raise
 
     async def generate_stream(
@@ -266,6 +296,11 @@ class OpenAILLM:
                         raise
                     if _cancel_requested(cancel_run_id):
                         raise LLMRunCancelled("cancelled")
+                    try:
+                        bu = str(getattr(self.client, "base_url", "") or "")
+                        inc_llm_retry("deepseek" if "deepseek" in bu else ("qwen" if bu else "unknown"))
+                    except Exception:
+                        pass
                     await _llm_http_backoff(attempt)
             if response is None:
                 raise last_exc if last_exc else RuntimeError("LLM stream create failed")
@@ -333,6 +368,10 @@ class OpenAILLM:
                 )
                 span.patch()
         except LLMRunCancelled as e:
+            try:
+                inc_cancel("llm_cancel")
+            except Exception:
+                pass
             if span is not None:
                 span.end(
                     error="cancelled",
@@ -371,6 +410,12 @@ class OpenAILLM:
                 span.patch()
             raise e
         except Exception as e:
+            # Non-cancel failures: count for monitoring.
+            try:
+                bu = str(getattr(self.client, "base_url", "") or "")
+                inc_llm_failure("deepseek" if "deepseek" in bu else ("qwen" if bu else "unknown"))
+            except Exception:
+                pass
             if span is not None:
                 span.end(
                     error=str(e),

@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import { config } from '../config.js'
 import { markCancelled } from '../cancelRegistry.js'
 import { postPythonBuffer } from '../pythonUpstream.js'
+import { cancelsTotal } from '../metrics.js'
 
 /** Forward cooperative cancel to Python (same run_id as X-Run-Id on /api/chat/stream). */
 export default async function cancelRoutes(fastify: FastifyInstance) {
@@ -12,6 +13,7 @@ export default async function cancelRoutes(fastify: FastifyInstance) {
       return reply.status(400).send({ ok: false, reason: 'missing_run_id' })
     }
     markCancelled(runId)
+    cancelsTotal.inc({ service: 'node', source: 'api_cancel' })
     const { status, body: pyBody } = await postPythonBuffer(`${config.pythonServiceUrl}/api/cancel`, {
       run_id: runId,
     })

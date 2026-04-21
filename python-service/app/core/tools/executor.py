@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from app.core.tools.base import BaseTool, ToolContext, ToolError
 from app.core.tools.idempotency import InMemoryIdempotencyStore
 from app.core.tools.registry import ToolRegistry
+from app.core.metrics import inc_tool_error
 
 
 class ToolExecutor:
@@ -78,6 +79,10 @@ class ToolExecutor:
                 )
             return out
         except ToolError as e:
+            try:
+                inc_tool_error(tool=name, code=e.code, retriable=bool(e.retriable))
+            except Exception:
+                pass
             if span is not None:
                 span.end(
                     error=e.message,
@@ -91,6 +96,10 @@ class ToolExecutor:
                 span.patch()
             raise
         except Exception as e:
+            try:
+                inc_tool_error(tool=name, code="INTERNAL", retriable=False)
+            except Exception:
+                pass
             if span is not None:
                 span.end(
                     error=str(e),

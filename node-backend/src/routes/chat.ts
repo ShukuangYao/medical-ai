@@ -5,6 +5,7 @@ import type { ChatResponse } from '../types/index.js'
 import { v4 as uuidv4 } from 'uuid'
 import { getCurrentRunTree, traceable } from 'langsmith/traceable'
 import { consumeCancelled } from '../cancelRegistry.js'
+import { cancelsTotal } from '../metrics.js'
 
 /** LangSmith only: avoid logging huge `report` / long strings (does not change HTTP response). */
 function sanitizeNodeChatTraceOutputs(outputs: Readonly<ChatResponse>): Record<string, unknown> {
@@ -319,6 +320,7 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       let clientAborted = false
       const onClose = () => {
         clientAborted = true
+        cancelsTotal.inc({ service: 'node', source: 'client_abort' })
         try {
           incoming.destroy(new Error('client_disconnected'))
         } catch {

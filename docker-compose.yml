@@ -16,6 +16,10 @@ services:
       - PYTHON_SERVICE_URL=http://python-service:8000
       - REDIS_URL=redis://redis:6379
       - PORT=3001
+      # Phase 3: distributed tracing (LangSmith)
+      - LANGSMITH_TRACING_V2=${LANGSMITH_TRACING_V2}
+      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY}
+      - LANGSMITH_PROJECT=${LANGSMITH_PROJECT}
     depends_on:
       - python-service
       - redis
@@ -28,6 +32,10 @@ services:
       - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
       - LLM_MODEL=qwen3.5-flash
       - LLM_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
+      # Phase 3: distributed tracing (LangSmith)
+      - LANGSMITH_TRACING_V2=${LANGSMITH_TRACING_V2}
+      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY}
+      - LANGSMITH_PROJECT=${LANGSMITH_PROJECT}
       - MILVUS_HOST=milvus-standalone
       - MILVUS_PORT=19530
       - ES_HOST=elasticsearch

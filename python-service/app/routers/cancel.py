@@ -7,6 +7,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from app.core.run_cancel import request_cancel
+from app.core.metrics import inc_cancel
 
 router = APIRouter()
 
@@ -22,6 +23,7 @@ async def cancel_generation(body: CancelRequest) -> Dict[str, Any]:
     if not rid:
         return {"ok": False, "reason": "missing_run_id"}
     request_cancel(rid)
+    inc_cancel("api_cancel")
     return {"ok": True, "run_id": rid}
 
 
@@ -32,4 +34,5 @@ async def cancel_generation_delete(run_id: str) -> Dict[str, Any]:
     if not rid:
         return {"ok": False, "reason": "missing_run_id"}
     request_cancel(rid)
+    inc_cancel("api_cancel")
     return {"ok": True, "run_id": rid}
