@@ -743,6 +743,7 @@ class MedicalAgentOrchestrator:
                             mode="agent",
                             role="user",
                             content=raw_question,
+                            run_id=cancel_run_id,
                         )
                     except Exception as e:
                         yield _thinking(f"⚠️ 会话写入失败: {e}")
@@ -814,6 +815,7 @@ class MedicalAgentOrchestrator:
                                 mode="agent",
                                 role="assistant",
                                 content=str(report.get("summary") or ""),
+                                run_id=cancel_run_id,
                                 report=report,
                                 sources=None,
                                 trace=report.get("trace") if isinstance(report, dict) else None,
@@ -1554,6 +1556,7 @@ class MedicalAgentOrchestrator:
                             mode="agent",
                             role="assistant",
                             content=str(report.get("summary") or ""),
+                            run_id=cancel_run_id,
                             report=report,
                             sources=sources if sources else None,
                             trace=report.get("trace") if isinstance(report, dict) else None,

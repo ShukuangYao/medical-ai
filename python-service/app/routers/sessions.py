@@ -58,6 +58,7 @@ async def get_messages(session_id: str, userId: Optional[str] = None, mode: str 
         "messages": [
             {
                 "id": m.id,
+                "runId": m.run_id,
                 "role": m.role,
                 "content": m.content,
                 "report": m.report_json,

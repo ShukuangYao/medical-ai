@@ -120,6 +120,27 @@ pnpm run dev
 - **详细分析**（仅病历分析 Tab）：打开后走 `agent_pipeline=full`（分角色多轮 LLM，更细但更慢）；关闭为默认 `fast`（合并步骤，更快）
 - **默认大模型**：Python 侧在未传 `model_provider` 时默认 **DeepSeek**，各角色在 DeepSeek 下统一 **`deepseek-chat`**；需要整条 Agent 链路用 Qwen 时，请在请求中传 `model_provider: "qwen"`，或设置 `AGENT_DEFAULT_LLM_PROVIDER=qwen`（详见 `docs/design.md` 与 `README.md`）
 
+### 停止生成（可控取消）
+
+- 前端 Stop 按钮会先调用 **`POST /api/cancel`**（携带 `run_id`），再中断 SSE 连接。
+- 取消是**协作式**（cooperative）：服务端会尽快停止后续阶段/并发任务；若某个上游 LLM 请求已在网络中飞行，可能需要等待其返回或超时才能完全结束。
+
+### 反馈闭环（评分/纠错）
+
+- 每条 AI 回答支持 `👍 有用 / 👎 无用 / 纠错（可选文本）`
+- 网关接口：`POST http://localhost:3001/api/feedback`
+- Python 本地落库：SQLite 表 `chat_feedback`（默认 DB：`medical-ai/python-service/app/data/chat_sessions.db`）
+
+查看最近反馈（SQLite）：
+
+```bash
+sqlite3 medical-ai/python-service/app/data/chat_sessions.db \
+"SELECT created_at, run_id, session_id, message_id, mode, user_id, rating, comment, corrected_answer
+ FROM chat_feedback
+ ORDER BY created_at DESC
+ LIMIT 50;"
+```
+
 ## 注意事项
 
 ⚠️ **重要提示**
@@ -137,6 +158,20 @@ pnpm run dev
 
 ### 前端TypeScript错误
 运行 `pnpm install` 确保所有依赖已安装。
+
+### 反馈接口返回 502（python_feedback_failed）
+
+说明 Node 网关转发到 Python 失败。请检查：
+
+- Python 服务是否在 `http://localhost:8000` 启动（或 `PYTHON_SERVICE_URL` 是否指向正确地址）
+- Python 日志是否报错（尤其是 JSON body 校验：需要 `run_id/session_id/message_id`）
+
+### 指标（/metrics）无数据或 404
+
+- Node：`GET http://localhost:3001/metrics`
+- Python：`GET http://localhost:8000/metrics`
+
+若 Python 未安装 `prometheus-client`，会降级为空实现（不影响主流程）。
 
 ## 技术支持
 

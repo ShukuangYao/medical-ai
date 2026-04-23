@@ -98,6 +98,20 @@ export const chatAPI = {
     const response = await api.get('/health')
     return response.data
   },
+
+  submitFeedback: async (payload: {
+    run_id: string
+    session_id: string
+    message_id: string
+    mode: 'rag' | 'agent'
+    user_id?: string
+    rating: number
+    comment?: string
+    corrected_answer?: string
+  }): Promise<{ ok: boolean; feedback_id?: string }> => {
+    const response = await api.post('/feedback', payload)
+    return response.data
+  },
 }
 
 export default api

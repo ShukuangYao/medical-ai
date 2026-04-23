@@ -63,6 +63,8 @@ export interface Message {
   id: string
   role: 'user' | 'assistant'
   content: string
+  /** Correlates to Node/Python `run_id` (needed for cancel/feedback). */
+  runId?: string
   sources?: Source[]
   trace?: TraceItem[]
   report?: AgentReport

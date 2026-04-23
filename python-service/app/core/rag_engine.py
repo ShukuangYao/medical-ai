@@ -365,6 +365,7 @@ class LocalDocQA:
                                 mode="rag",
                                 role="user",
                                 content=question,
+                                run_id=cancel_run_id,
                             )
                         except Exception as e:
                             print(f"写入会话消息失败: {e}")
@@ -372,7 +373,63 @@ class LocalDocQA:
                 # 步骤0：上下文消解
                 original_question = question
                 resolved_question = question
-                if chat_history and len(chat_history) >= 2 and self.context_resolver:
+                skip_context_resolve = False
+
+                # Heuristic: user may be answering the assistant's follow-up questions ("补充信息"),
+                # e.g. assistant asks "请补充肝肾功能是否正常？" and user replies "目前肝肾功能正常".
+                # In this case, treat the user message as supplemental info for the previous user question,
+                # otherwise the RAG pipeline will incorrectly answer the supplement as a standalone question.
+                try:
+                    q_norm = (question or "").strip()
+                    last = (chat_history or [])[-1] if (chat_history or []) else None
+                    last_role = str((last or {}).get("role") or "")
+                    last_text = str((last or {}).get("content") or "")
+                    assistant_asks_more = (
+                        last_role == "assistant"
+                        and any(
+                            k in last_text
+                            for k in (
+                                "补充",
+                                "关键信息",
+                                "为了给出更准确",
+                                "请提供",
+                                "请补充",
+                                "需要你补充",
+                                "请问",
+                            )
+                        )
+                    )
+                    looks_like_answer = (
+                        q_norm
+                        and len(q_norm) <= 80
+                        and ("?" not in q_norm)
+                        and ("？" not in q_norm)
+                        and (not q_norm.endswith("吗"))
+                        and (not q_norm.endswith("嘛"))
+                    )
+                    if assistant_asks_more and looks_like_answer:
+                        prev_user = ""
+                        for h in reversed(chat_history or []):
+                            if str(h.get("role") or "") == "user":
+                                prev_user = str(h.get("content") or "").strip()
+                                if prev_user:
+                                    break
+                        if prev_user:
+                            combined = (
+                                f"用户原问题：{prev_user}\n"
+                                f"助手追问：{last_text.strip()[:400]}\n"
+                                f"用户补充信息：{q_norm}\n"
+                                "请基于以上原问题与补充信息继续给出回答，并在缺少关键信息时继续追问。"
+                            )
+                            question = combined
+                            resolved_question = combined
+                            skip_context_resolve = True
+                            if emit_thinking:
+                                yield _thinking("🧩 已识别为对上一轮追问的补充信息，将沿原问题继续回答。")
+                except Exception:
+                    pass
+
+                if (not skip_context_resolve) and chat_history and len(chat_history) >= 2 and self.context_resolver:
                     if emit_thinking:
                         yield _thinking("🔗 正在消解上下文指代...")
                     _cr_start, cr_t0 = span_times()
@@ -762,6 +819,7 @@ class LocalDocQA:
                             mode="rag",
                             role="assistant",
                             content=full_answer,
+                            run_id=cancel_run_id,
                             sources=sources,
                             thinking_steps=thinking_steps if thinking_steps else None,
                         )

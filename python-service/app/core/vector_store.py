@@ -3,7 +3,7 @@ import numpy as np
 from typing import List, Dict, Optional, Tuple
 from pymilvus import connections, Collection, FieldSchema, CollectionSchema, DataType, utility
 from app.config import settings
-
+import time
 
 class VectorStoreMilvusClient:
     """Milvus向量库客户端，支持MMR算法实现相关+多样检索"""
@@ -14,14 +14,24 @@ class VectorStoreMilvusClient:
         self.connected = False
 
     def connect(self):
-        """连接Milvus"""
-        connections.connect(
-            alias="default",
-            host=settings.MILVUS_HOST,
-            port=settings.MILVUS_PORT
-        )
-        self.connected = True
-        print(f"已连接Milvus: {settings.MILVUS_HOST}:{settings.MILVUS_PORT}")
+        """带自动重试的 Milvus 连接（修复 service not ready）"""
+        max_retries = 20
+        retry_interval = 5
+        for i in range(max_retries):
+            try:
+                connections.connect(
+                    alias="default",
+                    host=settings.MILVUS_HOST,
+                    port=settings.MILVUS_PORT,
+                    timeout=30
+                )
+                print("✅ Milvus 连接成功！")
+                self.connected = True
+                return
+            except Exception as e:
+                print(f"⏳ 连接 Milvus 失败 ({i+1}/{max_retries})，{retry_interval}秒后重试... 错误: {str(e)[:60]}")
+                time.sleep(retry_interval)
+        raise Exception("❌ 无法连接到 Milvus 服务，服务仍异常！")
 
     def create_collection(self, dimension: int = None):
         """创建集合"""
@@ -105,7 +115,7 @@ class VectorStoreMilvusClient:
             embeddings,
         ]
         self.collection.insert(data)
-        self.collection.flush()
+        # self.collection.flush()
         print(f"已插入 {len(docs)} 条文档")
 
     def search(self, query_embedding: List[float], top_k: int = None) -> List[Dict]:

@@ -15,9 +15,11 @@
 - **Frontend**：`http://localhost:3002`（Vite dev server，见 `frontend/vite.config.ts`）
 - **Node Backend**：`http://localhost:3001`
   - 健康检查：`GET /health`
+  - Prometheus 指标：`GET /metrics`
   - 前端通过 Vite proxy 将 `/api/`* 转发到 Node
 - **Python Service**：`http://localhost:8000`
   - 健康检查：`GET /health`
+  - Prometheus 指标：`GET /metrics`
 
 ### 环境要求
 
@@ -125,6 +127,32 @@ pnpm dev
 - **输出**：结构化病历分析报告（`report`，严格 JSON）+ 简短总结（`answer`/`report.summary`）+（可选）推理过程（`trace`）
 - **流式输出**：支持 SSE 流式（`thinking / intent / agent_step / sources / result / done`），前端会实时更新“思考过程”，并在 `result` 到达后渲染结构化卡片。
 - **默认大模型**：请求未传 `model_provider` 时，Python 侧默认 **`deepseek`**；在 DeepSeek 下各 Agent 角色统一使用 **`deepseek-chat`**（可通过 `AGENT_MODEL_*` 环境变量按角色覆盖）。若需整条链路仍用 Qwen，请在请求中显式传 `model_provider: "qwen"`，或设置环境变量 `AGENT_DEFAULT_LLM_PROVIDER=qwen`。
+
+### 停止生成（可控取消）
+
+- 前端 Stop 按钮会先调用 **`POST /api/cancel`**（携带 `run_id`），再中断 SSE 连接。
+- 取消是**协作式**（cooperative）：服务端会尽快停止后续阶段/并发任务；若某个上游 LLM 请求已在网络中飞行，可能需要等待其返回或超时才能完全结束。
+
+### 反馈闭环（评分/纠错）
+
+- 每条 assistant 消息支持：
+  - `👍 有用`（rating=+1）
+  - `👎 无用`（rating=-1）
+  - `纠错`（可选文本：comment / corrected_answer）
+- 反馈通过 **`POST /api/feedback`** 提交，并关联：
+  - `run_id`：本次生成的运行 ID（用于 tracing/取消/反馈的主键）
+  - `session_id`：会话 ID
+  - `message_id`：前端消息 ID（assistant 那条）
+
+本地查看反馈（SQLite）：
+
+```bash
+sqlite3 medical-ai/python-service/app/data/chat_sessions.db \
+"SELECT created_at, run_id, session_id, message_id, mode, user_id, rating, comment, corrected_answer
+ FROM chat_feedback
+ ORDER BY created_at DESC
+ LIMIT 50;"
+```
 
 #### 快速模式 vs 详细模式（多 Agent 仍在）
 
@@ -299,7 +327,11 @@ RAG 可能会降级走 **Elasticsearch** 或其它检索来源；是否可用取
 
 - Node 健康检查：`GET http://localhost:3001/health`
 - Python 健康检查：`GET http://localhost:8000/health`
+- Node 指标：`GET http://localhost:3001/metrics`
+- Python 指标：`GET http://localhost:8000/metrics`
 - Node 配置回显：`GET http://localhost:3001/api/config`
+  - 取消：`POST http://localhost:3001/api/cancel`（body：`{"run_id":"..."}`）
+  - 反馈：`POST http://localhost:3001/api/feedback`（body：`{"run_id":"...","session_id":"...","message_id":"...","mode":"rag|agent","rating":1|-1|0,"comment":"","corrected_answer":""}`）
 
 ### 配置与环境变量
 
@@ -325,6 +357,9 @@ RAG 可能会降级走 **Elasticsearch** 或其它检索来源；是否可用取
 - **Neo4j（Compose）**：数据使用命名卷 `neo4j-data`；宿主机访问 HTTP `7475`、Bolt `7688`（避免与本机 Neo4j Desktop 默认端口冲突）。
 - **病历分析默认 LLM**：未传 `model_provider` 时默认 **DeepSeek**；各角色在 DeepSeek 下统一 **`deepseek-chat`**（`AGENT_DEFAULT_LLM_PROVIDER` / `AGENT_MODEL_*` 可覆盖）；意图识别与本轮 `model_provider` 对齐。
 - **LangSmith**：Agent / RAG 的 LLM 子 span 命名包含 **provider + model**，便于在 Traces 中区分（Node 侧根 trace 亦可带动态 name/metadata）。
+- **可控取消**：新增 `POST /api/cancel`，前端 Stop 会先请求服务端取消再断开 SSE；Node/Python 会把取消状态写入 tracing/metrics。
+- **反馈闭环**：新增 `POST /api/feedback`；前端对每条回答提供 `👍/👎/纠错`，反馈写入 SQLite 表 `chat_feedback`（同 `CHAT_DB_PATH`），并 best-effort 写回 LangSmith feedback（若启用）。
+- **Prometheus 指标**：Node/Python 暴露 `GET /metrics`，包含 `http_requests_total/http_request_duration_ms` 等，以及取消/重试/失败等指标（详见 `docs/harness-six-layer-optimization.md`）。
 
 ## 会话（Sessions）
 

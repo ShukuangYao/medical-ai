@@ -35,7 +35,7 @@ function ChatBox({ mode }: ChatBoxProps) {
   const assistantMsgIdRef = useRef<string>('')
 
   // 读取当前 tab（mode prop）的状态
-  const { messages, loading } = useChatStore((s) => s.perMode[mode])
+  const { messages, loading, sessionId } = useChatStore((s) => s.perMode[mode])
   const { addMessageForSession, updateMessageByIdForSession, setLoadingForMode } = useChatStore()
   const { modelProvider, modelName, setModelProvider, setModelName } = useChatStore()
   const { userId } = useChatStore()
@@ -277,7 +277,13 @@ function ChatBox({ mode }: ChatBoxProps) {
             }))
           },
           onRunId: (runId) => {
-            if (runId.trim()) currentRunIdRef.current = runId.trim()
+            const rid = runId.trim()
+            if (!rid) return
+            currentRunIdRef.current = rid
+            updateMessageByIdForSession(requestModeRef.current, requestSessionIdRef.current, aid, (msg) => ({
+              ...msg,
+              runId: rid,
+            }))
           },
           onSession: (id) => {
             requestSessionIdRef.current = id
@@ -382,7 +388,13 @@ function ChatBox({ mode }: ChatBoxProps) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '70vh' }}>
-      <MessageList messages={messages} mode={mode} onToggleThinking={handleToggleThinking} />
+      <MessageList
+        messages={messages}
+        mode={mode}
+        sessionId={sessionId ?? undefined}
+        userId={userId}
+        onToggleThinking={handleToggleThinking}
+      />
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
         <ThunderboltOutlined />
         <Text type="secondary" style={{ fontSize: 12 }}>流式输出</Text>

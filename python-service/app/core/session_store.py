@@ -28,6 +28,7 @@ class SessionRow:
 class MessageRow:
     id: str
     session_id: str
+    run_id: Optional[str]
     role: str  # "user" | "assistant"
     content: str
     report_json: Optional[Dict[str, Any]]
@@ -53,8 +54,16 @@ class SessionStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
+        # WAL is preferred for concurrent readers/writers, but can fail on some filesystems
+        # (or if -wal/-shm files are corrupted). Fall back to DELETE to keep the service up.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        except sqlite3.OperationalError:
+            try:
+                conn.execute("PRAGMA journal_mode=DELETE;")
+            except Exception:
+                pass
         conn.execute("PRAGMA foreign_keys=ON;")
         conn.execute("PRAGMA busy_timeout=5000;")
         return conn
@@ -161,6 +170,8 @@ class SessionStore:
 
         _add_column("chat_messages_v2", "thinking_steps_json", "TEXT")
         _add_column("chat_messages", "thinking_steps_json", "TEXT")
+        _add_column("chat_messages_v2", "run_id", "TEXT")
+        _add_column("chat_messages", "run_id", "TEXT")
 
     @staticmethod
     def _session_key(*, session_id: str, mode: str) -> str:
@@ -360,6 +371,7 @@ class SessionStore:
         mode: str,
         role: str,
         content: str,
+        run_id: Optional[str] = None,
         report: Optional[Dict[str, Any]] = None,
         sources: Optional[List[Dict[str, Any]]] = None,
         trace: Optional[List[Dict[str, Any]]] = None,
@@ -381,9 +393,9 @@ class SessionStore:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO chat_messages_v2
-                  (id, session_key, session_id, mode, role, content, report_json, sources_json, trace_json, thinking_steps_json, created_at)
+                  (id, session_key, session_id, mode, role, content, run_id, report_json, sources_json, trace_json, thinking_steps_json, created_at)
                 VALUES
-                  (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message_id,
@@ -392,6 +404,7 @@ class SessionStore:
                     mode,
                     role,
                     content,
+                    (str(run_id).strip() if run_id is not None and str(run_id).strip() else None),
                     json.dumps(report, ensure_ascii=False) if report is not None else None,
                     json.dumps(sources, ensure_ascii=False) if sources is not None else None,
                     json.dumps(trace, ensure_ascii=False) if trace is not None else None,
@@ -417,15 +430,16 @@ class SessionStore:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO chat_messages
-                  (id, session_id, role, content, report_json, sources_json, trace_json, thinking_steps_json, created_at)
+                  (id, session_id, role, content, run_id, report_json, sources_json, trace_json, thinking_steps_json, created_at)
                 VALUES
-                  (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message_id,
                     session_id,
                     role,
                     content,
+                    (str(run_id).strip() if run_id is not None and str(run_id).strip() else None),
                     json.dumps(report, ensure_ascii=False) if report is not None else None,
                     json.dumps(sources, ensure_ascii=False) if sources is not None else None,
                     json.dumps(trace, ensure_ascii=False) if trace is not None else None,
@@ -469,6 +483,7 @@ class SessionStore:
                 MessageRow(
                     id=str(d["id"]),
                     session_id=str(d["session_id"]),
+                    run_id=(str(d.get("run_id")) if d.get("run_id") is not None else None),
                     role=str(d["role"]),
                     content=str(d["content"]),
                     report_json=_loads(d.get("report_json")),

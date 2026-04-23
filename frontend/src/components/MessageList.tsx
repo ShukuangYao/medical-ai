@@ -1,9 +1,10 @@
-import { Card, Typography, Collapse, Tag, Space, Descriptions, Divider } from 'antd'
+import { Card, Typography, Collapse, Tag, Space, Descriptions, Divider, Button, Tooltip, Modal, Input, message } from 'antd'
 import { UserOutlined, RobotOutlined } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
-import { useLayoutEffect, useMemo, useRef } from 'react'
+import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { Message, ChatMode } from '../types/shared'
 import { sanitizeDisplayText } from '../utils/markdownSanitize'
+import { chatAPI } from '../services/api'
 
 const { Text, Paragraph } = Typography
 const { Panel } = Collapse
@@ -18,14 +19,25 @@ const sourceTagStyle: Record<string, { label: string; color: string }> = {
 interface MessageListProps {
   messages: Message[]
   mode: ChatMode
+  sessionId?: string
+  userId?: string
   onToggleThinking?: (messageIndex: number, expanded: boolean) => void
 }
 
-function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
+function MessageList({ messages, mode, sessionId, userId, onToggleThinking }: MessageListProps) {
   const pageText = (page?: number) => (typeof page === 'number' && page >= 1 ? `第${page}页` : null)
   const bottomRef = useRef<HTMLDivElement | null>(null)
   const containerRef = useRef<HTMLDivElement | null>(null)
   const shouldStickRef = useRef(true)
+  const [ratedByMsg, setRatedByMsg] = useState<Record<string, number>>({})
+  const [correcting, setCorrecting] = useState<{ open: boolean; messageId: string; runId: string }>({
+    open: false,
+    messageId: '',
+    runId: '',
+  })
+  const [correctedAnswer, setCorrectedAnswer] = useState('')
+  const [comment, setComment] = useState('')
+  const [submitting, setSubmitting] = useState(false)
   const triageColor = (level?: string) => {
     if (level === 'emergency') return 'red'
     if (level === 'urgent') return 'orange'
@@ -140,6 +152,80 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
                 {msg.role === 'user' ? <UserOutlined /> : <RobotOutlined />}
                 <Text strong>{msg.role === 'user' ? '用户' : 'AI助手'}</Text>
               </Space>
+              {msg.role === 'assistant' ? (
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+                  <Tooltip title={!msg.runId ? '旧消息未保存 run_id：仍可记录到本地反馈（不回写 LangSmith）' : '有用'}>
+                    <Button
+                      size="small"
+                      disabled={!sessionId || submitting || ratedByMsg[msg.id] === 1}
+                      onClick={async () => {
+                        if (!sessionId) return
+                        setSubmitting(true)
+                        try {
+                          await chatAPI.submitFeedback({
+                            run_id: msg.runId ?? '',
+                            session_id: sessionId,
+                            message_id: msg.id,
+                            mode,
+                            user_id: userId,
+                            rating: 1,
+                          })
+                          setRatedByMsg((m) => ({ ...m, [msg.id]: 1 }))
+                          message.success('已记录：有用')
+                        } catch (e: any) {
+                          message.error(`反馈失败：${e?.message || 'unknown'}`)
+                        } finally {
+                          setSubmitting(false)
+                        }
+                      }}
+                    >
+                      👍 有用
+                    </Button>
+                  </Tooltip>
+                  <Tooltip title={!msg.runId ? '旧消息未保存 run_id：仍可记录到本地反馈（不回写 LangSmith）' : '无用'}>
+                    <Button
+                      size="small"
+                      disabled={!sessionId || submitting || ratedByMsg[msg.id] === -1}
+                      onClick={async () => {
+                        if (!sessionId) return
+                        setSubmitting(true)
+                        try {
+                          await chatAPI.submitFeedback({
+                            run_id: msg.runId ?? '',
+                            session_id: sessionId,
+                            message_id: msg.id,
+                            mode,
+                            user_id: userId,
+                            rating: -1,
+                          })
+                          setRatedByMsg((m) => ({ ...m, [msg.id]: -1 }))
+                          message.success('已记录：无用')
+                        } catch (e: any) {
+                          message.error(`反馈失败：${e?.message || 'unknown'}`)
+                        } finally {
+                          setSubmitting(false)
+                        }
+                      }}
+                    >
+                      👎 无用
+                    </Button>
+                  </Tooltip>
+                  <Tooltip title={!msg.runId ? '旧消息未保存 run_id：仍可记录到本地反馈（不回写 LangSmith）' : '纠错（可选文本）'}>
+                    <Button
+                      size="small"
+                      disabled={!sessionId || submitting}
+                      onClick={() => {
+                        if (!sessionId) return
+                        setCorrectedAnswer('')
+                        setComment('')
+                        setCorrecting({ open: true, messageId: msg.id, runId: msg.runId ?? '' })
+                      }}
+                    >
+                      纠错
+                    </Button>
+                  </Tooltip>
+                </div>
+              ) : null}
               {msg.role === 'assistant' && msg.thinkingSteps && msg.thinkingSteps.length > 0 && (
                 <Collapse
                   ghost
@@ -254,7 +340,12 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
                               </ReactMarkdown>
                             </Paragraph>
                             {p.disclaimer ? (
-                              <Text type="secondary">免责声明：{sanitizeDisplayText(p.disclaimer)}</Text>
+                              <Paragraph
+                                type="secondary"
+                                style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}
+                              >
+                                免责声明：{sanitizeDisplayText(p.disclaimer)}
+                              </Paragraph>
                             ) : null}
                           </Space>
                         )
@@ -338,6 +429,57 @@ function MessageList({ messages, mode, onToggleThinking }: MessageListProps) {
             </Space>
           </Card>
         ))}
+        <Modal
+          open={correcting.open}
+          title="纠错/补充（可选）"
+          okText="提交"
+          cancelText="取消"
+          confirmLoading={submitting}
+          onCancel={() => setCorrecting({ open: false, messageId: '', runId: '' })}
+          onOk={async () => {
+            if (!sessionId || !correcting.runId || !correcting.messageId) return
+            setSubmitting(true)
+            try {
+              await chatAPI.submitFeedback({
+                run_id: correcting.runId,
+                session_id: sessionId,
+                message_id: correcting.messageId,
+                mode,
+                user_id: userId,
+                rating: 0,
+                comment,
+                corrected_answer: correctedAnswer,
+              })
+              message.success('已提交纠错')
+              setCorrecting({ open: false, messageId: '', runId: '' })
+            } catch (e: any) {
+              message.error(`纠错失败：${e?.message || 'unknown'}`)
+            } finally {
+              setSubmitting(false)
+            }
+          }}
+        >
+          <Space direction="vertical" style={{ width: '100%' }} size={10}>
+            <div>
+              <div style={{ marginBottom: 6 }}>纠正后的答案（可选）</div>
+              <Input.TextArea
+                value={correctedAnswer}
+                onChange={(e) => setCorrectedAnswer(e.target.value)}
+                autoSize={{ minRows: 4, maxRows: 10 }}
+                placeholder="贴上你认为更准确/更安全的答案（可留空）"
+              />
+            </div>
+            <div>
+              <div style={{ marginBottom: 6 }}>备注（可选）</div>
+              <Input.TextArea
+                value={comment}
+                onChange={(e) => setComment(e.target.value)}
+                autoSize={{ minRows: 2, maxRows: 6 }}
+                placeholder="例如：哪里不准确、缺少哪些信息、希望如何改进…（可留空）"
+              />
+            </div>
+          </Space>
+        </Modal>
         <div ref={bottomRef} />
       </Space>
     </div>

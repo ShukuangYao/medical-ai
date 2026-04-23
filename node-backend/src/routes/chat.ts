@@ -6,6 +6,7 @@ import { v4 as uuidv4 } from 'uuid'
 import { getCurrentRunTree, traceable } from 'langsmith/traceable'
 import { consumeCancelled } from '../cancelRegistry.js'
 import { cancelsTotal } from '../metrics.js'
+import { markLangsmithRunId } from '../runRegistry.js'
 
 /** LangSmith only: avoid logging huge `report` / long strings (does not change HTTP response). */
 function sanitizeNodeChatTraceOutputs(outputs: Readonly<ChatResponse>): Record<string, unknown> {
@@ -133,6 +134,12 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       const lsHeaders: Record<string, string> = {}
       const runTree = getCurrentRunTree() as any
       if (runTree && typeof runTree.toHeaders === 'function') Object.assign(lsHeaders, runTree.toHeaders())
+      try {
+        // Map correlation run_id -> LangSmith run id for feedback writing later.
+        if (runTree?.id) markLangsmithRunId(runId, String(runTree.id))
+      } catch {
+        // ignore
+      }
 
       const requestHeaders: Record<string, string> = {
         'X-Request-ID': requestId,
@@ -267,6 +274,11 @@ export default async function chatRoutes(fastify: FastifyInstance) {
       const lsHeaders: Record<string, string> = {}
       const runTree = getCurrentRunTree() as any
       if (runTree && typeof runTree.toHeaders === 'function') Object.assign(lsHeaders, runTree.toHeaders())
+      try {
+        if (runTree?.id) markLangsmithRunId(runId, String(runTree.id))
+      } catch {
+        // ignore
+      }
 
       const requestHeaders: Record<string, string> = {
         'X-Request-ID': requestId,
@@ -349,9 +361,9 @@ export default async function chatRoutes(fastify: FastifyInstance) {
         // Mark the node root run as cancelled (shows up in LangSmith "Error" column).
         throw new Error(clientAborted ? 'client_disconnected' : 'cancelled')
       }
-      // IMPORTANT: this route streams the response; do not return a JSON body,
-      // otherwise Fastify will attempt to send a second response.
-      return { cancelled }
+      // IMPORTANT: this route streams the response; do not return a JSON body.
+      // Also return no value so LangSmith "Output" column stays empty (otherwise it shows `false/true`).
+      return
       },
       {
         name: buildLangsmithRunName({

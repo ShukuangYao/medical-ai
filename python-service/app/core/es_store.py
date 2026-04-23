@@ -1,5 +1,5 @@
 """ElasticSearch客户端 - BM25全文检索"""
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from elasticsearch import Elasticsearch
 from app.config import settings
 
@@ -131,11 +131,54 @@ class StoreElasticSearchClient:
         if not self.client:
             raise RuntimeError("ES未连接")
 
+        def _normalize_query(q: str) -> Tuple[str, str]:
+            """Return (raw, filtered) query.
+
+            Many user questions are of the form "<entity>怎么办/怎么治/如何处理".
+            For BM25, the generic part ("怎么办") can dominate and retrieve irrelevant
+            "<anything>怎么办" documents. We therefore filter common generic phrases.
+            """
+            raw = (q or "").strip()
+            if not raw:
+                return "", ""
+            # Remove common generic suffix/prefix phrases (Chinese).
+            generic = (
+                "怎么办",
+                "怎么治",
+                "怎么治疗",
+                "如何治",
+                "如何治疗",
+                "如何处理",
+                "怎么处理",
+                "怎么缓解",
+                "如何缓解",
+                "怎么改善",
+                "如何改善",
+                "怎么回事",
+                "是什么原因",
+                "原因是什么",
+                "该怎么办",
+                "要怎么办",
+                "怎么办呢",
+                "怎么办呀",
+                "怎么办啊",
+            )
+            filtered = raw
+            for g in generic:
+                filtered = filtered.replace(g, " ")
+            filtered = " ".join(filtered.split()).strip()
+            # Guard: if filtering removes everything, fall back to raw.
+            if not filtered:
+                filtered = raw
+            return raw, filtered
+
         # 防止 query 过长导致 ES 解析成过多子句（触发 maxClauseCount）。
         # multi_match 会把 query 分词后在多个字段构造 should 子句，长文本（如整段病历）很容易爆。
-        query = (query or "").strip()
-        if len(query) > 256:
-            query = query[:256]
+        raw_q, filtered_q = _normalize_query((query or "").strip())
+        if len(raw_q) > 256:
+            raw_q = raw_q[:256]
+        if len(filtered_q) > 256:
+            filtered_q = filtered_q[:256]
 
         '''
         fields: ["text^2", "title^3"]：title 影响更大
@@ -143,17 +186,55 @@ class StoreElasticSearchClient:
         minimum_should_match: "30%"：要求匹配的词占比达到一定程度
         所以这段 mappings 的核心意义是：把 text/title 做成“可全文检索的 text 字段”，其分词方式决定了 BM25 的效果。
         '''
-        body = {
-            "query": {
+        # Short queries are ambiguous; be stricter to avoid "怎么办" drift.
+        is_short = len(filtered_q) <= 8
+        msm = "70%" if is_short else "30%"
+        operator = "and" if is_short else "or"
+
+        # Use a bool query:
+        # - should: match raw (recall) + match filtered (precision) with higher boost
+        # - minimum_should_match: at least one should clause
+        # - if we have a meaningful filtered query, also add a must clause so "牙疼" must appear somewhere.
+        shoulds = [
+            {
                 "multi_match": {
-                    "query": query,
+                    "query": raw_q,
                     "fields": ["text^2", "title^3"],
                     "type": "best_fields",
-                    "minimum_should_match": "30%"
+                    "operator": operator,
+                    "minimum_should_match": msm,
                 }
-            },
-            "size": k
-        }
+            }
+        ]
+        if filtered_q and filtered_q != raw_q:
+            shoulds.append(
+                {
+                    "multi_match": {
+                        "query": filtered_q,
+                        "fields": ["title^5", "text^3"],
+                        "type": "best_fields",
+                        "operator": "and",
+                        "minimum_should_match": "80%",
+                    }
+                }
+            )
+
+        musts = []
+        # If filtered query is meaningful, force it to appear (reduces "XX怎么办" false positives).
+        if filtered_q and len(filtered_q) >= 2:
+            musts.append(
+                {
+                    "multi_match": {
+                        "query": filtered_q,
+                        "fields": ["title^3", "text^2"],
+                        "type": "best_fields",
+                        "operator": "and",
+                        "minimum_should_match": "80%",
+                    }
+                }
+            )
+
+        body = {"query": {"bool": {"must": musts, "should": shoulds, "minimum_should_match": 1}}, "size": k}
 
         response = self.client.search(index=self.index_name, body=body)
 

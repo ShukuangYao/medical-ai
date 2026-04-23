@@ -1,4 +1,5 @@
 """BGE嵌入模型 - 使用BAAI/bge-large-zh"""
+import os
 import numpy as np
 from typing import List
 from sentence_transformers import SentenceTransformer
@@ -15,7 +16,12 @@ class BGEEmbeddings:
     def load(self):
         """加载嵌入模型"""
         print(f"正在加载嵌入模型: {self.model_name}")
-        self.model = SentenceTransformer(self.model_name)
+        # On macOS, MPS can OOM easily for large embedding models (e.g. bge-large-zh).
+        # Default to CPU for stability; override via EMBEDDING_DEVICE=cpu|mps|cuda.
+        device = os.getenv("EMBEDDING_DEVICE", "").strip().lower()
+        if not device:
+            device = "cpu"
+        self.model = SentenceTransformer(self.model_name, device=device)
         print(f"嵌入模型加载完成，维度: {self.model.get_sentence_embedding_dimension()}")
 
     def embed_query(self, text: str) -> List[float]:
@@ -31,15 +37,44 @@ class BGEEmbeddings:
         """将多条文档文本批量转为向量"""
         if self.model is None:
             self.load()
-        # macOS MPS 上 batch_size 太大会触发 out of memory
         # normalize_embeddings=True：对向量做归一化（配合向量数据库的相似度度量更方便）
-        embeddings = self.model.encode(
-            texts,
-            normalize_embeddings=True,
-            batch_size=8,
-            show_progress_bar=False,
-        )
-        return embeddings.tolist()
+        # Try a conservative batch_size; if MPS OOM happens, retry with smaller batch / CPU.
+        batch = int(os.getenv("EMBEDDING_BATCH_SIZE", "8") or "8")
+        batch = max(1, min(batch, 64))
+        try:
+            embeddings = self.model.encode(
+                texts,
+                normalize_embeddings=True,
+                batch_size=batch,
+                show_progress_bar=False,
+            )
+            return embeddings.tolist()
+        except RuntimeError as e:
+            msg = str(e)
+            if "MPS backend out of memory" not in msg and "out of memory" not in msg:
+                raise
+            # Retry: smaller batch
+            try:
+                embeddings = self.model.encode(
+                    texts,
+                    normalize_embeddings=True,
+                    batch_size=1,
+                    show_progress_bar=False,
+                )
+                return embeddings.tolist()
+            except Exception:
+                # Last resort: switch to CPU and retry once.
+                try:
+                    self.model.to("cpu")
+                except Exception:
+                    pass
+                embeddings = self.model.encode(
+                    texts,
+                    normalize_embeddings=True,
+                    batch_size=1,
+                    show_progress_bar=False,
+                )
+                return embeddings.tolist()
 
     @property
     def dimension(self) -> int:

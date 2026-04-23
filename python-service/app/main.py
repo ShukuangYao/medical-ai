@@ -10,7 +10,7 @@ if not os.getenv("LANGSMITH_TRACING_V2"):
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from langsmith.middleware import TracingMiddleware
-from app.routers import rag, agent, sessions, cancel
+from app.routers import rag, agent, sessions, cancel, feedback
 import time
 import logging
 from app.core import metrics as prom_metrics
@@ -84,6 +84,7 @@ app.include_router(rag.router, prefix="/api", tags=["RAG"])
 app.include_router(agent.router, prefix="/api", tags=["Agent"])
 app.include_router(sessions.router, prefix="/api", tags=["Sessions"])
 app.include_router(cancel.router, prefix="/api", tags=["Cancel"])
+app.include_router(feedback.router, prefix="/api", tags=["Feedback"])
 
 @app.get("/metrics")
 async def metrics() -> Response:
