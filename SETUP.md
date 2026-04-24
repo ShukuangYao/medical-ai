@@ -60,6 +60,64 @@ docker compose up --build
 
 **数据说明**：Compose 中 Neo4j 数据目录使用 **Docker 命名卷 `neo4j-data`**，不再绑定到仓库下的 `./data/neo4j`。若你本地曾有旧的 `./data/neo4j` 数据，需要自行迁移进 volume（启动后是新库）。
 
+## 数据导入（Neo4j / Milvus / ES）
+
+> 说明：本 Demo 的检索链路依赖 **Neo4j 图谱** 与 **Milvus/ES 索引**。如果你只是想跑通 UI 与 SSE，可以先不导入数据；但要演示“图谱检索/溯源 sources”，建议按下述步骤导入。
+
+### 1) 导入 Neo4j 图谱数据
+
+脚本：`python-service/scripts/build_neo4j_graph.py`  
+数据文件（仓库已提供）：`python-service/data/medical_new_2.json`
+
+确保 `.env` 中 Neo4j 连接信息正确（compose 内默认是 `NEO4J_URI=bolt://neo4j:7687`）：
+
+- `NEO4J_URI`
+- `NEO4J_USER`（默认 `neo4j`）
+- `NEO4J_PASSWORD`（与 `NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}` 一致）
+
+执行导入（在 Python 环境中运行）：
+
+```bash
+cd medical-ai/python-service
+
+# 首次导入或需要重建：加 --clear
+python scripts/build_neo4j_graph.py \
+  --data-file data/medical_new_2.json \
+  --clear
+```
+
+验证（可选）：
+
+```bash
+cd medical-ai/python-service
+python scripts/verify_neo4j.py
+```
+
+### 2) 导入 Milvus（向量）+ Elasticsearch（关键词）索引数据
+
+脚本：`python-service/scripts/load_huatuo_data.py`
+
+确保 `.env` 中 Milvus/ES 连接信息正确（compose 内默认使用 service 名）：
+
+- `MILVUS_HOST=milvus-standalone`
+- `MILVUS_PORT=19530`
+- `ES_HOST=elasticsearch`
+- `ES_PORT=9200`
+
+执行导入（在 Python 环境中运行）：
+
+```bash
+cd medical-ai/python-service
+
+# 建议先用小规模验证（例如 50）
+python scripts/load_huatuo_data.py --max-samples 50
+
+# 需要重建索引（会 drop Milvus collection + drop ES index）：
+python scripts/load_huatuo_data.py --max-samples 200 --reset
+```
+
+> 说明：该脚本会加载嵌入模型与重排序模型，首次运行较慢；建议在有网络与足够内存的环境执行。
+
 ## 本地开发模式
 
 ### 1. 启动Python AI服务

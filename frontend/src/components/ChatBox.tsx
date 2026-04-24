@@ -1,5 +1,5 @@
-import { useState, useRef, useCallback, useMemo } from 'react'
-import { Input, Button, Space, message, Spin, Switch, Typography, Select } from 'antd'
+import { useState, useRef, useCallback, useMemo, useEffect } from 'react'
+import { Input, Button, Space, message, Spin, Switch, Typography, Select, Tooltip } from 'antd'
 import { SendOutlined, ThunderboltOutlined, StopOutlined } from '@ant-design/icons'
 import { useChatStore } from '../store/chatStore'
 import { chatAPI } from '../services/api'
@@ -39,6 +39,34 @@ function ChatBox({ mode }: ChatBoxProps) {
   const { addMessageForSession, updateMessageByIdForSession, setLoadingForMode } = useChatStore()
   const { modelProvider, modelName, setModelProvider, setModelName } = useChatStore()
   const { userId } = useChatStore()
+
+  // Persist agent "detailed analysis" toggle across page reloads (demo-friendly preference).
+  useEffect(() => {
+    const uid = (userId || '').trim() || 'anonymous'
+    const key = `medical-ai:pref:agentDetailMode:${uid}`
+    try {
+      const raw = window.localStorage.getItem(key)
+      if (raw === null) return
+      const v = raw === '1' || raw.toLowerCase() === 'true'
+      setAgentDetailMode(v)
+    } catch {
+      // ignore
+    }
+  }, [userId])
+
+  const handleSetAgentDetailMode = useCallback(
+    (v: boolean) => {
+      setAgentDetailMode(v)
+      const uid = (userId || '').trim() || 'anonymous'
+      const key = `medical-ai:pref:agentDetailMode:${uid}`
+      try {
+        window.localStorage.setItem(key, v ? '1' : '0')
+      } catch {
+        // ignore
+      }
+    },
+    [userId]
+  )
 
   const formatAgentStep = (step: any): string => {
     const agent = step?.agent ?? 'agent'
@@ -403,8 +431,12 @@ function ChatBox({ mode }: ChatBoxProps) {
         <Switch size="small" checked={graphMode} onChange={setGraphMode} disabled={mode !== 'rag' || loading} />
         {mode === 'agent' ? (
           <>
-            <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>详细分析</Text>
-            <Switch size="small" checked={agentDetailMode} onChange={setAgentDetailMode} disabled={loading} />
+            <Tooltip title={agentDetailMode ? '已开启：full 管线（更慢、更多阶段与中间产物）' : '未开启：fast 管线（更快、步骤更少）'}>
+              <Text type="secondary" style={{ fontSize: 12, marginLeft: 8, cursor: 'help' }}>详细分析</Text>
+            </Tooltip>
+            <Tooltip title={agentDetailMode ? 'full：更详细但更慢' : 'fast：更快但更简略'}>
+              <Switch size="small" checked={agentDetailMode} onChange={handleSetAgentDetailMode} disabled={loading} />
+            </Tooltip>
           </>
         ) : null}
         {mode === 'rag' ? (

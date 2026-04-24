@@ -180,6 +180,63 @@ sqlite3 medical-ai/python-service/app/data/chat_sessions.db \
 - `summary`: 1–3 句总结（含免责声明）
 - `trace`: 多 agent 过程记录（用于前端折叠面板展示/调试）
 
+## 数据导入（Neo4j / Milvus / ES）
+
+> 本 Demo 的两类知识来源：
+>
+> - **Neo4j**：疾病-症状-药品-检查-科室等图谱关系（用于图谱检索增强）。
+> - **Milvus + Elasticsearch**：RAG 用的向量检索 + 关键词检索索引（用于普通问答与 Agent evidence）。
+
+### 导入 Neo4j 图谱数据
+
+数据文件（仓库已提供）：`python-service/data/medical_new_2.json`（JSONL，每行一个 JSON，脚本对尾部逗号有容错）。
+
+1) 确保 Neo4j 已启动（Compose 方式默认映射）：
+
+- Neo4j Browser：`http://localhost:7475`
+- Bolt：`bolt://localhost:7688`
+
+2) 在 **Python 环境** 中执行图谱构建脚本：
+
+```bash
+cd medical-ai/python-service
+
+# 首次导入或需要重建：加 --clear
+python scripts/build_neo4j_graph.py \
+  --data-file data/medical_new_2.json \
+  --clear
+```
+
+3) 验证图谱可用（会跑几条典型查询）：
+
+```bash
+cd medical-ai/python-service
+python scripts/verify_neo4j.py
+```
+
+### 导入 Milvus（向量）+ Elasticsearch（关键词）索引数据
+
+脚本：`python-service/scripts/load_huatuo_data.py`（从 HuggingFace 拉取华佗测试数据集，生成 doc，并写入 Milvus/ES）。
+
+1) 确保 Milvus 与 ES 已启动：
+
+- Milvus：`localhost:19530`（Compose 中为 `milvus-standalone:19530`）
+- ES：`http://localhost:9200`（Compose 中为 `elasticsearch:9200`）
+
+2) 在 **Python 环境** 中执行索引脚本：
+
+```bash
+cd medical-ai/python-service
+
+# 建议先用小规模验证（例如 50）
+python scripts/load_huatuo_data.py --max-samples 50
+
+# 需要重建索引（会 drop Milvus collection + drop ES index）：
+python scripts/load_huatuo_data.py --max-samples 200 --reset
+```
+
+> 说明：该脚本会加载嵌入模型与重排序模型，首次运行较慢；建议在有网络与足够内存的环境执行。
+
 ## 总体架构
 
 ```mermaid
