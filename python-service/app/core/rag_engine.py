@@ -37,6 +37,8 @@ from app.core.tools.base import ToolContext, ToolError
 from app.core.tools.executor import ToolExecutor
 from app.core.tools.registry import ToolRegistry
 from app.core.tools.impl import GraphQueryTool, HybridRetrieveTool, RerankTool, RewriteQuestionTool
+from app.core.tools.idempotency_key import make_idempotency_key
+from app.core.tools.sse_helpers import tool_result_to_sse_error, record_tool_result_perf
 from app.core.run_cancel import is_cancelled as run_cancelled
 
 from langsmith import RunTree
@@ -316,6 +318,7 @@ class LocalDocQA:
                     run_id=effective_run_id,
                     mode="rag",
                 )
+                perf: Dict[str, Any] = {}
 
                 if not self.initialized:
                     if emit_thinking:
@@ -553,18 +556,32 @@ class LocalDocQA:
                             ).hexdigest()[:12]
                         except Exception:
                             hist_sig = ""
-                        rewritten_question = await self.tools.run(
+                        _args = {"question": question, "chat_history": chat_history}
+                        _key = make_idempotency_key(
+                            namespace="rag",
+                            tool_name="rewrite_question",
+                            ctx=rag_tool_ctx,
+                            args={"question": question, "chat_history_sig": hist_sig},
+                            extra=question[:80],
+                        )
+                        res = await self.tools.run_result(
                             "rewrite_question",
-                            args={"question": question, "chat_history": chat_history},
+                            args=_args,
                             ctx=rag_tool_ctx,
                             trace_inputs={"question": question, "chat_history_len": len(chat_history or [])},
                             # Do NOT key by session_id; users can ask the same question in a new session.
-                            idempotency_key=f"rewrite:{effective_user_id}:{hist_sig}:{question}",
+                            idempotency_key=_key,
                             idempotency_ttl_s=float(getattr(settings, "RAG_REWRITE_CACHE_TTL_S", 120.0)),
                         )
-                    except ToolError as e:
-                        # Keep compatibility: error content remains string; add code/retriable for clients that read it.
-                        yield {"type": "error", "content": e.message, **e.to_event_fields()}
+                        record_tool_result_perf(perf=perf, tool="rewrite_question", res=res)
+                        if res.ok and isinstance(res.data, str):
+                            rewritten_question = res.data
+                        else:
+                            evt = tool_result_to_sse_error(res=res, phase="rewrite", fallback_message="rewrite failed")
+                            if evt is not None:
+                                yield evt
+                            rewritten_question = question
+                    except Exception:
                         rewritten_question = question
                     rw_evt = tel.end("rewrite")
                     if emit_thinking and rw_evt:
@@ -845,6 +862,7 @@ class LocalDocQA:
                         "output_chars": len(full_answer),
                         "sources_count": len(sources),
                         "duration_ms": perf_ms_since(run_t0),
+                        "perf": perf,
                     },
                     metadata={"duration_ms": perf_ms_since(run_t0)},
                 )

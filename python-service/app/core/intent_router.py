@@ -12,6 +12,7 @@ from app.core.reranker import BGEReranker
 from app.core.llm_client import OpenAILLM
 from app.core.tools.base import ToolContext
 from app.core.tools.executor import ToolExecutor
+from app.core.tools.idempotency_key import make_idempotency_key
 
 
 class IntentRouter:
@@ -115,14 +116,31 @@ class IntentRouter:
             return cached[1]
 
         if self.tools is not None:
-            out = await self.tools.run(
+            res = await self.tools.run_result(
                 "rerank",
                 args={"query": query, "docs": candidates, "top_k": top_k},
                 ctx=tool_ctx,
-                trace_inputs={"query": query, "docs_count": len(candidates), "top_k": top_k, "cached": False},
-                idempotency_key=f"rag:{uid}:{sid}:{rid}:rerank:{query}:{len(candidates)}:{top_k}",
+                trace_inputs={"query": query, "docs_count": len(candidates), "top_k": top_k},
+                idempotency_key=make_idempotency_key(
+                    namespace="rag",
+                    tool_name="rerank",
+                    ctx=tool_ctx,
+                    args={"query": query, "docs_count": len(candidates), "top_k": top_k},
+                    extra=f"{query[:60]}:{len(candidates)}:{top_k}",
+                ),
                 idempotency_ttl_s=ttl,
             )
+            if not res.ok:
+                # Preserve behavior: bubble up as ToolError so caller can map to SSE error.
+                err = res.error
+                raise ToolError(
+                    code=(err.code if err else "INTERNAL"),
+                    message=(err.message if err else "rerank failed"),
+                    retriable=bool(err.retriable) if err else False,
+                    detail=(err.detail if err else None),
+                    upstream_status=(err.upstream_status if err else None),
+                )
+            out = res.data or []
         else:
             out = self.reranker.rerank(query, candidates, top_k=top_k)
         try:
@@ -195,14 +213,30 @@ class IntentRouter:
 
         if self.graph_querier and entity:
             if self.tools is not None:
-                graph_docs = await self.tools.run(
+                res = await self.tools.run_result(
                     "graph_query",
                     args={"intent": intent, "entity": entity},
                     ctx=tool_ctx,
                     trace_inputs={"intent": intent, "entity": entity},
-                    idempotency_key=f"rag:{uid}:{sid}:{rid}:graph_query:{intent}:{entity}",
+                    idempotency_key=make_idempotency_key(
+                        namespace="rag",
+                        tool_name="graph_query",
+                        ctx=tool_ctx,
+                        args={"intent": intent, "entity": entity},
+                        extra=f"{intent}:{entity}",
+                    ),
                     idempotency_ttl_s=float(getattr(settings, "RAG_RERANK_CACHE_TTL_S", 120.0)),
                 )
+                if not res.ok:
+                    err = res.error
+                    raise ToolError(
+                        code=(err.code if err else "INTERNAL"),
+                        message=(err.message if err else "graph_query failed"),
+                        retriable=bool(err.retriable) if err else False,
+                        detail=(err.detail if err else None),
+                        upstream_status=(err.upstream_status if err else None),
+                    )
+                graph_docs = res.data or []
             else:
                 graph_docs = self.graph_querier.query(intent, entity)
             all_docs.extend(graph_docs)
@@ -214,14 +248,30 @@ class IntentRouter:
         # 向量检索补充
         print("[IntentRouter] supplement retrieval: vector+ES only (skip graph duplicate)")
         if self.tools is not None:
-            vector_docs = await self.tools.run(
+            res = await self.tools.run_result(
                 "hybrid_retrieve",
                 args={"query": question},
                 ctx=tool_ctx,
                 trace_inputs={"query": question},
-                idempotency_key=f"rag:{uid}:{sid}:{rid}:hybrid_retrieve:{question}",
+                idempotency_key=make_idempotency_key(
+                    namespace="rag",
+                    tool_name="hybrid_retrieve",
+                    ctx=tool_ctx,
+                    args={"query": question},
+                    extra=question[:80],
+                ),
                 idempotency_ttl_s=float(getattr(settings, "RAG_RERANK_CACHE_TTL_S", 120.0)),
             )
+            if not res.ok:
+                err = res.error
+                raise ToolError(
+                    code=(err.code if err else "INTERNAL"),
+                    message=(err.message if err else "hybrid_retrieve failed"),
+                    retriable=bool(err.retriable) if err else False,
+                    detail=(err.detail if err else None),
+                    upstream_status=(err.upstream_status if err else None),
+                )
+            vector_docs = res.data or []
         else:
             vector_docs = await self.retriever.retrieve(question)
         all_docs.extend(vector_docs)
@@ -268,14 +318,30 @@ class IntentRouter:
         sid = (tool_ctx.session_id or "").strip() or "default"
         rid = (tool_ctx.run_id or "").strip()
         if self.tools is not None:
-            docs = await self.tools.run(
+            res = await self.tools.run_result(
                 "hybrid_retrieve",
                 args={"query": question},
                 ctx=tool_ctx,
                 trace_inputs={"query": question},
-                idempotency_key=f"rag:{uid}:{sid}:{rid}:hybrid_retrieve:{question}",
+                idempotency_key=make_idempotency_key(
+                    namespace="rag",
+                    tool_name="hybrid_retrieve",
+                    ctx=tool_ctx,
+                    args={"query": question},
+                    extra=question[:80],
+                ),
                 idempotency_ttl_s=float(getattr(settings, "RAG_RERANK_CACHE_TTL_S", 120.0)),
             )
+            if not res.ok:
+                err = res.error
+                raise ToolError(
+                    code=(err.code if err else "INTERNAL"),
+                    message=(err.message if err else "hybrid_retrieve failed"),
+                    retriable=bool(err.retriable) if err else False,
+                    detail=(err.detail if err else None),
+                    upstream_status=(err.upstream_status if err else None),
+                )
+            docs = res.data or []
         else:
             docs = await self.retriever.retrieve(question)
         if len(docs) > 3:

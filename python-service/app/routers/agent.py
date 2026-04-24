@@ -16,14 +16,6 @@ from langsmith.run_helpers import get_current_run_tree, tracing_context
 router = APIRouter()
 DEFAULT_USER_ID = "anonymous"
 
-@router.on_event("startup")
-async def startup():
-    try:
-        _ = await get_agent_orchestrator()
-        print("多智能体编排器已初始化")
-    except Exception as e:
-        print(f"Agent编排器初始化失败: {e}")
-
 @router.post("/agent/stream")
 async def agent_diagnose_stream(http_request: Request, request: ChatRequest):
     """多智能体协作诊断（流式输出）"""
@@ -171,7 +163,7 @@ async def agent_diagnose(http_request: Request, request: ChatRequest):
         try:
             from app.models.response import AgentReport
 
-            report = AgentReport.parse_obj(report).dict()
+            report = AgentReport.model_validate(report).model_dump()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"结构化报告校验失败: {e}")
 

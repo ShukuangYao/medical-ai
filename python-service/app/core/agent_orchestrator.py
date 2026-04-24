@@ -21,8 +21,11 @@ from app.core.tools.base import ToolContext, ToolError
 from app.core.tools.executor import ToolExecutor
 from app.core.tools.registry import ToolRegistry
 from app.core.tools.impl import GraphQueryTool, HybridRetrieveTool, RerankTool, RewriteQuestionTool
+from app.core.tools.idempotency_key import make_idempotency_key
 from app.core.run_cancel import is_cancelled as run_cancelled
 from app.core.report_validator import normalize_and_validate_agent_report
+from app.core.tools.result import ToolErrorPayload
+from app.core.tools.sse_helpers import tool_result_to_sse_error, record_tool_result_perf
 
 from langsmith import RunTree
 from langsmith.run_helpers import get_current_run_tree, tracing_context
@@ -490,6 +493,10 @@ class MedicalAgentOrchestrator:
         return {"type": "error", "content": e.message, "phase": "evidence_retrieval", **e.to_event_fields()}
 
     @staticmethod
+    def _evidence_error_event_from_payload(p: ToolErrorPayload) -> Dict[str, Any]:
+        return {"type": "error", "content": p.message, "phase": "evidence_retrieval", **p.to_event_fields()}
+
+    @staticmethod
     def _agent_cancel_requested(cancel_run_id: Optional[str]) -> bool:
         return bool(cancel_run_id) and run_cancelled(cancel_run_id)
 
@@ -513,6 +520,7 @@ class MedicalAgentOrchestrator:
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        perf: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
         """
         Retrieve sources for grounding (retrieval-only; no LLM generation).
@@ -537,6 +545,8 @@ class MedicalAgentOrchestrator:
         except Exception:
             pass
 
+        _perf = perf if isinstance(perf, dict) else None
+
         sources: List[Dict[str, Any]] = []
         brief: List[str] = []
         sse_errors: List[Dict[str, Any]] = []
@@ -552,30 +562,54 @@ class MedicalAgentOrchestrator:
                 ctx = ToolContext(user_id=uid, session_id=sid, run_id=rid, mode="agent")
                 graph_docs: List[Dict[str, Any]] = []
                 if use_graph and entity:
-                    try:
-                        graph_docs = await self.tools.run(
-                            "graph_query",
-                            args={"intent": intent, "entity": str(entity)},
-                            ctx=ctx,
-                            trace_inputs={"intent": intent, "entity": str(entity)},
-                            idempotency_key=f"agent:{uid}:{sid}:{rid}:graph_query:{intent}:{entity}",
-                            idempotency_ttl_s=300.0,
-                        )
-                    except ToolError as e:
-                        sse_errors.append(self._evidence_tool_error_event(e))
-                        graph_docs = []
-                hybrid_docs: List[Dict[str, Any]] = []
-                try:
-                    hybrid_docs = await self.tools.run(
-                        "hybrid_retrieve",
-                        args={"query": q},
+                    _args = {"intent": intent, "entity": str(entity)}
+                    res = await self.tools.run_result(
+                        "graph_query",
+                        args=_args,
                         ctx=ctx,
-                        trace_inputs={"query": q},
-                        idempotency_key=f"agent:{uid}:{sid}:{rid}:hybrid_retrieve:{q}",
+                        trace_inputs={"intent": intent, "entity": str(entity)},
+                        idempotency_key=make_idempotency_key(
+                            namespace="agent",
+                            tool_name="graph_query",
+                            ctx=ctx,
+                            args=_args,
+                            extra=f"{intent}:{entity}",
+                        ),
                         idempotency_ttl_s=300.0,
                     )
-                except ToolError as e:
-                    sse_errors.append(self._evidence_tool_error_event(e))
+                    if _perf is not None:
+                        record_tool_result_perf(perf=_perf, tool="graph_query", res=res)
+                    if res.ok:
+                        graph_docs = res.data or []
+                    else:
+                        evt = tool_result_to_sse_error(res=res, phase="evidence_retrieval", fallback_message="graph_query failed")
+                        if evt is not None:
+                            sse_errors.append(evt)
+                        graph_docs = []
+                hybrid_docs: List[Dict[str, Any]] = []
+                _args = {"query": q}
+                res = await self.tools.run_result(
+                    "hybrid_retrieve",
+                    args=_args,
+                    ctx=ctx,
+                    trace_inputs={"query": q},
+                    idempotency_key=make_idempotency_key(
+                        namespace="agent",
+                        tool_name="hybrid_retrieve",
+                        ctx=ctx,
+                        args=_args,
+                        extra=q[:80],
+                    ),
+                    idempotency_ttl_s=300.0,
+                )
+                if _perf is not None:
+                    record_tool_result_perf(perf=_perf, tool="hybrid_retrieve", res=res)
+                if res.ok:
+                    hybrid_docs = res.data or []
+                else:
+                    evt = tool_result_to_sse_error(res=res, phase="evidence_retrieval", fallback_message="hybrid_retrieve failed")
+                    if evt is not None:
+                        sse_errors.append(evt)
                     hybrid_docs = []
 
                 # Deduplicate: graph first
@@ -598,17 +632,29 @@ class MedicalAgentOrchestrator:
                 if len(supplement) > 8:
                     supplement = sorted(supplement, key=lambda d: float(d.get("score", 0.0)), reverse=True)[:8]
                 if len(supplement) > 6:
-                    try:
-                        supplement = await self.tools.run(
-                            "rerank",
-                            args={"query": q, "docs": supplement, "top_k": 8},
+                    _args = {"query": q, "docs": supplement, "top_k": 8}
+                    res = await self.tools.run_result(
+                        "rerank",
+                        args=_args,
+                        ctx=ctx,
+                        trace_inputs={"query": q, "docs_count": len(supplement), "top_k": 8},
+                        idempotency_key=make_idempotency_key(
+                            namespace="agent",
+                            tool_name="rerank",
                             ctx=ctx,
-                            trace_inputs={"query": q, "docs_count": len(supplement), "top_k": 8},
-                            idempotency_key=f"agent:{uid}:{sid}:{rid}:rerank:{q}:{len(supplement)}",
-                            idempotency_ttl_s=300.0,
-                        )
-                    except ToolError as e:
-                        sse_errors.append(self._evidence_tool_error_event(e))
+                            args={"query": q, "docs_count": len(supplement), "top_k": 8},
+                            extra=f"{q[:60]}:{len(supplement)}:8",
+                        ),
+                        idempotency_ttl_s=300.0,
+                    )
+                    if _perf is not None:
+                        record_tool_result_perf(perf=_perf, tool="rerank", res=res)
+                    if res.ok:
+                        supplement = res.data or supplement
+                    else:
+                        evt = tool_result_to_sse_error(res=res, phase="evidence_retrieval", fallback_message="rerank failed")
+                        if evt is not None:
+                            sse_errors.append(evt)
                         supplement = supplement[:8]
                 docs = (graph_kept + supplement)[:10]
             else:
@@ -1067,6 +1113,7 @@ class MedicalAgentOrchestrator:
                         user_id=user_id or "anonymous",
                         session_id=session_id,
                         run_id=cancel_run_id,
+                        perf=perf,
                     )
                 )
 

@@ -13,6 +13,7 @@ from app.core.tools.auth import AuthPolicy
 from app.core.tools.base import BaseTool, ToolContext, ToolError
 from app.core.tools.idempotency import IdempotencyStore, create_idempotency_store, InMemoryIdempotencyStore
 from app.core.tools.registry import ToolRegistry
+from app.core.tools.result import ToolErrorPayload, ToolResult
 from app.core.metrics import inc_tool_error
 
 
@@ -26,11 +27,13 @@ class ToolExecutor:
         default_idempotency_ttl_s: float = 60.0,
     ) -> None:
         self.registry = registry
+        # Default SQLite idempotency DB should be independent from session DB to reduce lock contention.
+        default_sqlite = os.path.join(os.path.dirname(str(getattr(settings, "CHAT_DB_PATH", ""))), "tool_idempotency.db")
         self.idempotency: IdempotencyStore = idempotency or create_idempotency_store(
             sqlite_path=str(
                 os.getenv(
                     "TOOL_IDEMPOTENCY_SQLITE_PATH",
-                    str(getattr(settings, "CHAT_DB_PATH", "")),
+                    default_sqlite,
                 )
             ),
             redis_url=str(getattr(settings, "REDIS_URL", "")),
@@ -38,7 +41,7 @@ class ToolExecutor:
         self.auth = auth or AuthPolicy.from_env()
         self.default_idempotency_ttl_s = float(default_idempotency_ttl_s)
 
-    async def run(
+    async def run_result(
         self,
         name: str,
         *,
@@ -47,19 +50,38 @@ class ToolExecutor:
         idempotency_key: Optional[str] = None,
         idempotency_ttl_s: Optional[float] = None,
         trace_inputs: Optional[Dict[str, Any]] = None,
-    ) -> Any:
+    ) -> ToolResult[Any]:
         tool = self.registry.get(name)
         if tool is None:
-            raise ToolError(code="NOT_FOUND", message=f"Tool not found: {name}", retriable=False)
+            return ToolResult(
+                ok=False,
+                error=ToolErrorPayload(code="NOT_FOUND", message=f"Tool not found: {name}", retriable=False),
+                cached=False,
+                idempotency_key=idempotency_key,
+            )
 
         # Hard auth (Phase 1): best-effort guard for expensive/sensitive tools
-        self.auth.authorize(tool=tool, ctx=ctx)
+        try:
+            self.auth.authorize(tool=tool, ctx=ctx)
+        except ToolError as e:
+            return ToolResult(
+                ok=False,
+                error=ToolErrorPayload(
+                    code=e.code,
+                    message=e.message,
+                    retriable=bool(e.retriable),
+                    detail=e.detail,
+                    upstream_status=e.upstream_status,
+                ),
+                cached=False,
+                idempotency_key=idempotency_key,
+            )
 
         # Idempotency cache (best-effort)
         if idempotency_key:
             cached = self.idempotency.get(idempotency_key)
             if cached is not None:
-                return cached
+                return ToolResult(ok=True, data=cached, cached=True, duration_ms=0, idempotency_key=idempotency_key)
 
         parent = get_current_run_tree()
         span = None
@@ -84,8 +106,9 @@ class ToolExecutor:
                 ) from e
 
             out = await tool.run(args=model_args, ctx=ctx)
+            duration_ms = int((time.perf_counter() - t0) * 1000)
             if span is not None:
-                span.end(outputs={"ok": True, "duration_ms": int((time.perf_counter() - t0) * 1000)})
+                span.end(outputs={"ok": True, "duration_ms": duration_ms})
                 span.patch()
 
             if idempotency_key:
@@ -94,8 +117,15 @@ class ToolExecutor:
                     out,
                     ttl_s=idempotency_ttl_s if idempotency_ttl_s is not None else self.default_idempotency_ttl_s,
                 )
-            return out
+            return ToolResult(
+                ok=True,
+                data=out,
+                cached=False,
+                duration_ms=duration_ms,
+                idempotency_key=idempotency_key,
+            )
         except ToolError as e:
+            duration_ms = int((time.perf_counter() - t0) * 1000)
             try:
                 inc_tool_error(tool=name, code=e.code, retriable=bool(e.retriable))
             except Exception:
@@ -107,12 +137,25 @@ class ToolExecutor:
                         "ok": False,
                         "code": e.code,
                         "retriable": e.retriable,
-                        "duration_ms": int((time.perf_counter() - t0) * 1000),
+                        "duration_ms": duration_ms,
                     },
                 )
                 span.patch()
-            raise
+            return ToolResult(
+                ok=False,
+                error=ToolErrorPayload(
+                    code=e.code,
+                    message=e.message,
+                    retriable=bool(e.retriable),
+                    detail=e.detail,
+                    upstream_status=e.upstream_status,
+                ),
+                cached=False,
+                duration_ms=duration_ms,
+                idempotency_key=idempotency_key,
+            )
         except Exception as e:
+            duration_ms = int((time.perf_counter() - t0) * 1000)
             try:
                 inc_tool_error(tool=name, code="INTERNAL", retriable=False)
             except Exception:
@@ -120,8 +163,43 @@ class ToolExecutor:
             if span is not None:
                 span.end(
                     error=str(e),
-                    outputs={"ok": False, "code": "INTERNAL", "duration_ms": int((time.perf_counter() - t0) * 1000)},
+                    outputs={"ok": False, "code": "INTERNAL", "duration_ms": duration_ms},
                 )
                 span.patch()
-            raise ToolError(code="INTERNAL", message=f"{name} failed", retriable=False) from e
+            return ToolResult(
+                ok=False,
+                error=ToolErrorPayload(code="INTERNAL", message=f"{name} failed", retriable=False, detail={"err": str(e)}),
+                cached=False,
+                duration_ms=duration_ms,
+                idempotency_key=idempotency_key,
+            )
+
+    async def run(
+        self,
+        name: str,
+        *,
+        args: Dict[str, Any],
+        ctx: ToolContext,
+        idempotency_key: Optional[str] = None,
+        idempotency_ttl_s: Optional[float] = None,
+        trace_inputs: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        res = await self.run_result(
+            name,
+            args=args,
+            ctx=ctx,
+            idempotency_key=idempotency_key,
+            idempotency_ttl_s=idempotency_ttl_s,
+            trace_inputs=trace_inputs,
+        )
+        if res.ok:
+            return res.data
+        err = res.error or ToolErrorPayload(code="INTERNAL", message=f"{name} failed", retriable=False)
+        raise ToolError(
+            code=err.code,
+            message=err.message,
+            retriable=bool(err.retriable),
+            detail=err.detail,
+            upstream_status=err.upstream_status,
+        )
 

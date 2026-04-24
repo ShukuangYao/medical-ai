@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 
 # Hard default: keep all traces in a single LangSmith project.
 # Avoid accidental drift to "medicine-ai" from a stale shell/env.
@@ -15,8 +16,23 @@ import time
 import logging
 from app.core import metrics as prom_metrics
 from app.core.json_logging import configure_json_logging
+from app.core.singletons import ensure_rag_initialized, get_agent_orchestrator
 
-app = FastAPI(title="医疗AI辅助诊断系统 - Python服务")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Warm up heavy components once per process. Best-effort; service should still start if it fails.
+    try:
+        await ensure_rag_initialized()
+    except Exception as e:
+        print(f"RAG 引擎初始化失败（lifespan 预热）: {e}")
+    try:
+        _ = await get_agent_orchestrator()
+    except Exception as e:
+        print(f"Agent编排器初始化失败（lifespan 预热）: {e}")
+    yield
+
+
+app = FastAPI(title="医疗AI辅助诊断系统 - Python服务", lifespan=lifespan)
 
 # Phase 3: stable JSON logs (ensures `extra={...}` fields are always emitted)
 configure_json_logging()

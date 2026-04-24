@@ -15,17 +15,6 @@ router = APIRouter()
 
 DEFAULT_USER_ID = "anonymous"
 
-@router.on_event("startup")
-async def startup():
-    # Warm up heavy components (embeddings/reranker/DB clients) once per process.
-    try:
-        await ensure_rag_initialized()
-        print("RAG 引擎已初始化（startup 预热）")
-    except Exception as e:
-        # Allow service to start; requests will retry init path and/or degrade.
-        print(f"RAG 引擎初始化失败（startup 预热）: {e}")
-
-
 @router.post("/rag")
 async def rag_query(request: Request):
     """RAG问答（非流式）"""
