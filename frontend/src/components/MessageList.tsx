@@ -248,7 +248,7 @@ function MessageList({ messages, mode, sessionId, userId, onToggleThinking }: Me
               )}
 
               {!(mode === 'agent' && msg.role === 'assistant' && msg.report) && (
-                <Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>
+                <div style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>
                   <ReactMarkdown
                     components={{
                       p: ({ children }) => <p className="md-p" style={{ margin: '0 0 6px 0' }}>{children}</p>,
@@ -272,7 +272,7 @@ function MessageList({ messages, mode, sessionId, userId, onToggleThinking }: Me
                       remapRefs: true,
                     })}
                   </ReactMarkdown>
-                </Paragraph>
+                </div>
               )}
 
               {mode === 'agent' && msg.role === 'assistant' && msg.report && (
@@ -327,7 +327,7 @@ function MessageList({ messages, mode, sessionId, userId, onToggleThinking }: Me
                         const p = parsedAgentSummary(msg.report?.summary)
                         return (
                           <Space direction="vertical" style={{ width: '100%' }} size={6}>
-                            <Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>
+                            <div style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>
                               <ReactMarkdown
                                 components={{
                                   p: ({ children }) => <p className="md-p" style={{ margin: '0 0 6px 0' }}>{children}</p>,
@@ -338,7 +338,7 @@ function MessageList({ messages, mode, sessionId, userId, onToggleThinking }: Me
                               >
                                 {sanitizeDisplayText(p.summary || '—')}
                               </ReactMarkdown>
-                            </Paragraph>
+                            </div>
                             {p.disclaimer ? (
                               <Paragraph
                                 type="secondary"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Generic, Optional, Type, TypeVar
+from typing import Any, Dict, Generic, Optional, Sequence, Type, TypeVar
 
 from pydantic import BaseModel
 
@@ -53,6 +53,10 @@ OutT = TypeVar("OutT")
 class BaseTool(Generic[ArgsT, OutT]):
     name: str
     ArgsModel: Type[ArgsT]
+    # Hard authorization hook. When True, ToolExecutor must authorize the caller.
+    auth_required: bool = False
+    # Optional scopes for future expansion (kept simple for now).
+    required_scopes: Sequence[str] = ()
 
     async def run(self, *, args: ArgsT, ctx: ToolContext) -> OutT:  # pragma: no cover
         raise NotImplementedError

@@ -22,6 +22,7 @@ from app.core.tools.executor import ToolExecutor
 from app.core.tools.registry import ToolRegistry
 from app.core.tools.impl import GraphQueryTool, HybridRetrieveTool, RerankTool, RewriteQuestionTool
 from app.core.run_cancel import is_cancelled as run_cancelled
+from app.core.report_validator import normalize_and_validate_agent_report
 
 from langsmith import RunTree
 from langsmith.run_helpers import get_current_run_tree, tracing_context
@@ -505,7 +506,13 @@ class MedicalAgentOrchestrator:
         yield {"type": "done", "content": ""}
 
     async def _retrieve_evidence(
-        self, *, query: str, intent_result: Optional[Dict[str, Any]] = None
+        self,
+        *,
+        query: str,
+        intent_result: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], str, List[Dict[str, Any]]]:
         """
         Retrieve sources for grounding (retrieval-only; no LLM generation).
@@ -515,9 +522,14 @@ class MedicalAgentOrchestrator:
         if not q:
             return [], "未检索到可用参考资料", []
 
+        uid = (user_id or "").strip() or "anonymous"
+        sid = (session_id or "").strip() or "default"
+        rid = (run_id or "").strip()
+        cache_key = f"{uid}:{sid}:{q}"
+
         # Cache for 5 minutes to avoid repeated rerank on same query.
         try:
-            cached = self._evidence_cache.get(q)
+            cached = self._evidence_cache.get(cache_key)
             if cached:
                 ts, sources, brief = cached
                 if time.time() - ts < 300 and sources:
@@ -537,7 +549,7 @@ class MedicalAgentOrchestrator:
             docs: List[Dict[str, Any]] = []
             # Prefer tool boundary if available (Phase 1): graph_query + hybrid_retrieve + rerank.
             if self.tools is not None:
-                ctx = ToolContext(mode="agent")
+                ctx = ToolContext(user_id=uid, session_id=sid, run_id=rid, mode="agent")
                 graph_docs: List[Dict[str, Any]] = []
                 if use_graph and entity:
                     try:
@@ -546,7 +558,7 @@ class MedicalAgentOrchestrator:
                             args={"intent": intent, "entity": str(entity)},
                             ctx=ctx,
                             trace_inputs={"intent": intent, "entity": str(entity)},
-                            idempotency_key=f"graph_query:{intent}:{entity}",
+                            idempotency_key=f"agent:{uid}:{sid}:{rid}:graph_query:{intent}:{entity}",
                             idempotency_ttl_s=300.0,
                         )
                     except ToolError as e:
@@ -559,7 +571,7 @@ class MedicalAgentOrchestrator:
                         args={"query": q},
                         ctx=ctx,
                         trace_inputs={"query": q},
-                        idempotency_key=f"hybrid_retrieve:{q}",
+                        idempotency_key=f"agent:{uid}:{sid}:{rid}:hybrid_retrieve:{q}",
                         idempotency_ttl_s=300.0,
                     )
                 except ToolError as e:
@@ -592,7 +604,7 @@ class MedicalAgentOrchestrator:
                             args={"query": q, "docs": supplement, "top_k": 8},
                             ctx=ctx,
                             trace_inputs={"query": q, "docs_count": len(supplement), "top_k": 8},
-                            idempotency_key=f"rerank:{q}:{len(supplement)}",
+                            idempotency_key=f"agent:{uid}:{sid}:{rid}:rerank:{q}:{len(supplement)}",
                             idempotency_ttl_s=300.0,
                         )
                     except ToolError as e:
@@ -609,6 +621,7 @@ class MedicalAgentOrchestrator:
                         {"intent": intent, "entity": entity, "use_graph": use_graph},
                         q,
                         graph_enabled=True,
+                        tool_ctx=ToolContext(user_id=uid, session_id=sid, run_id=rid, mode="agent"),
                     )
                 except ToolError as e:
                     sse_errors.append(self._evidence_tool_error_event(e))
@@ -629,7 +642,7 @@ class MedicalAgentOrchestrator:
             pass
         brief_text = "\n".join(brief) if brief else "未检索到可用参考资料"
         try:
-            self._evidence_cache[q] = (time.time(), sources, brief_text)
+            self._evidence_cache[cache_key] = (time.time(), sources, brief_text)
         except Exception:
             pass
         return sources, brief_text, sse_errors
@@ -1048,7 +1061,13 @@ class MedicalAgentOrchestrator:
                         yield _ev
                     return
                 retrieve_task = asyncio.create_task(
-                    self._retrieve_evidence(query=str(retrieval_query), intent_result=intent_res)
+                    self._retrieve_evidence(
+                        query=str(retrieval_query),
+                        intent_result=intent_res,
+                        user_id=user_id or "anonymous",
+                        session_id=session_id,
+                        run_id=cancel_run_id,
+                    )
                 )
 
                 # In `full`, we will run merged agents later (after evidence retrieval):
@@ -1528,6 +1547,44 @@ class MedicalAgentOrchestrator:
                         report["summary"] = "病历信息不足，建议补充关键病史与检查结果后再评估（结果仅供参考，不能替代专业医生的诊断与建议）。"
                 except Exception:
                     pass
+
+                # Phase 5: schema validation + normalize + unified fallback path
+                validated_report, validation_err, validation_tags = normalize_and_validate_agent_report(
+                    report if isinstance(report, dict) else {}
+                )
+                if validation_tags:
+                    try:
+                        perf["report_validation_tags"] = list(validation_tags)
+                    except Exception:
+                        pass
+                    # Surface normalization warnings for debugging/QA; safe for clients to ignore.
+                    yield {
+                        "type": "agent_step",
+                        "content": {"agent": "ReportValidator", "step": "warnings", "detail": {"tags": validation_tags}},
+                    }
+                if validation_err is not None:
+                    # Keep stream contract: emit an error event, then a safe fallback report.
+                    yield {
+                        "type": "error",
+                        "content": "结构化报告校验失败，已降级为安全输出。",
+                        "phase": "report_validation",
+                        "code": "VALIDATION_ERROR",
+                        "retriable": False,
+                        "detail": validation_err,
+                    }
+                    report = self._build_fallback_report(
+                        validated_record=validated_record,
+                        intent=intent_payload,
+                        structured_case=structured_case,
+                        symptom_analysis=symptom_analysis,
+                        triage=triage,
+                        department=department,
+                        next_steps=next_steps,
+                        treatment_safety=treatment_safety,
+                        summary=str((validated_report or {}).get("summary") or report.get("summary") or ""),
+                    )
+                    validated_report, _, _ = normalize_and_validate_agent_report(report)
+                report = validated_report
 
                 if self._agent_cancel_requested(cancel_run_id):
                     async for _ev in self._agent_abort_stream(run, t0):

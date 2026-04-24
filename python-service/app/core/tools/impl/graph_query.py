@@ -16,6 +16,7 @@ class GraphQueryArgs(BaseModel):
 class GraphQueryTool(BaseTool[GraphQueryArgs, List[Dict[str, Any]]]):
     name = "graph_query"
     ArgsModel = GraphQueryArgs
+    auth_required = True
 
     def __init__(self, graph_querier: Optional[GraphQuerier]):
         self._graph = graph_querier

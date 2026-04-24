@@ -95,7 +95,7 @@ class IntentRouter:
                 break
         return out
 
-    async def _maybe_rerank(self, *, query: str, docs: List[Dict], top_k: int) -> List[Dict]:
+    async def _maybe_rerank(self, *, query: str, docs: List[Dict], top_k: int, tool_ctx: ToolContext) -> List[Dict]:
         if not docs:
             return []
         if len(docs) <= top_k:
@@ -105,7 +105,10 @@ class IntentRouter:
         candidates = self._prefilter_rerank_candidates(docs, max_n=max_n)
 
         ttl = float(getattr(settings, "RAG_RERANK_CACHE_TTL_S", 120.0))
-        key = self._rerank_cache_key(query=query, docs=candidates, top_k=top_k)
+        uid = (tool_ctx.user_id or "").strip() or "anonymous"
+        sid = (tool_ctx.session_id or "").strip() or "default"
+        rid = (tool_ctx.run_id or "").strip()
+        key = f"{uid}:{sid}:{rid}:{self._rerank_cache_key(query=query, docs=candidates, top_k=top_k)}"
         now = time.time()
         cached = self._rerank_cache.get(key)
         if cached and (now - float(cached[0])) <= ttl:
@@ -115,8 +118,10 @@ class IntentRouter:
             out = await self.tools.run(
                 "rerank",
                 args={"query": query, "docs": candidates, "top_k": top_k},
-                ctx=ToolContext(mode="rag"),
+                ctx=tool_ctx,
                 trace_inputs={"query": query, "docs_count": len(candidates), "top_k": top_k, "cached": False},
+                idempotency_key=f"rag:{uid}:{sid}:{rid}:rerank:{query}:{len(candidates)}:{top_k}",
+                idempotency_ttl_s=ttl,
             )
         else:
             out = self.reranker.rerank(query, candidates, top_k=top_k)
@@ -127,7 +132,11 @@ class IntentRouter:
         return out
 
     async def route(
-        self, intent_result: Dict, question: str, graph_enabled: bool = True
+        self,
+        intent_result: Dict,
+        question: str,
+        graph_enabled: bool = True,
+        tool_ctx: Optional[ToolContext] = None,
     ) -> tuple[List[Dict], str]:
         """
         根据意图路由到不同处理器
@@ -142,6 +151,7 @@ class IntentRouter:
         intent = intent_result["intent"]
         use_graph = bool(intent_result["use_graph"]) and graph_enabled
         entity = intent_result["entity"]
+        ctx = tool_ctx or ToolContext(mode="rag")
         print(
             f"[IntentRouter] intent={intent}, use_graph={use_graph}, graph_enabled={graph_enabled}, "
             f"entity={entity!r}, neo4j_ready={self.graph_querier is not None}"
@@ -160,9 +170,7 @@ class IntentRouter:
         # 3. 图谱查询类 - 优先图谱，补充向量检索
         if use_graph and graph_enabled and self.graph_querier and entity:
             print(f"[IntentRouter] route -> graph_enhanced (entity={entity})")
-            return await self._graph_enhanced_retrieve(
-                intent, entity, question
-            ), "graph_enhanced"
+            return await self._graph_enhanced_retrieve(intent, entity, question, tool_ctx=ctx), "graph_enhanced"
 
         # 4. 一般医疗问答 - 纯向量+ES混合检索
         if use_graph and not entity:
@@ -171,23 +179,29 @@ class IntentRouter:
             print("[IntentRouter] graph requested but neo4j not ready -> fallback hybrid")
         else:
             print("[IntentRouter] route -> hybrid_retrieve")
-        return await self._hybrid_retrieve(question), "hybrid_retrieve"
+        return await self._hybrid_retrieve(question, tool_ctx=ctx), "hybrid_retrieve"
 
     async def _graph_enhanced_retrieve(
-        self, intent: str, entity: str, question: str
+        self, intent: str, entity: str, question: str, *, tool_ctx: ToolContext
     ) -> List[Dict]:
         """图谱增强检索：图谱结果 + 向量检索补充"""
         graph_docs: List[Dict] = []
         all_docs = []
 
         # 图谱查询
+        uid = (tool_ctx.user_id or "").strip() or "anonymous"
+        sid = (tool_ctx.session_id or "").strip() or "default"
+        rid = (tool_ctx.run_id or "").strip()
+
         if self.graph_querier and entity:
             if self.tools is not None:
                 graph_docs = await self.tools.run(
                     "graph_query",
                     args={"intent": intent, "entity": entity},
-                    ctx=ToolContext(mode="rag"),
+                    ctx=tool_ctx,
                     trace_inputs={"intent": intent, "entity": entity},
+                    idempotency_key=f"rag:{uid}:{sid}:{rid}:graph_query:{intent}:{entity}",
+                    idempotency_ttl_s=float(getattr(settings, "RAG_RERANK_CACHE_TTL_S", 120.0)),
                 )
             else:
                 graph_docs = self.graph_querier.query(intent, entity)
@@ -203,8 +217,10 @@ class IntentRouter:
             vector_docs = await self.tools.run(
                 "hybrid_retrieve",
                 args={"query": question},
-                ctx=ToolContext(mode="rag"),
+                ctx=tool_ctx,
                 trace_inputs={"query": question},
+                idempotency_key=f"rag:{uid}:{sid}:{rid}:hybrid_retrieve:{question}",
+                idempotency_ttl_s=float(getattr(settings, "RAG_RERANK_CACHE_TTL_S", 120.0)),
             )
         else:
             vector_docs = await self.retriever.retrieve(question)
@@ -231,7 +247,9 @@ class IntentRouter:
             if d.get("id", d.get("text", "")[:50]) not in graph_ids
         ]
         if len(supplement_docs) > 3:
-            supplement_docs = await self._maybe_rerank(query=question, docs=supplement_docs, top_k=10)
+            supplement_docs = await self._maybe_rerank(
+                query=question, docs=supplement_docs, top_k=10, tool_ctx=tool_ctx
+            )
         final_docs = graph_kept + supplement_docs
 
         graph_count = sum(1 for d in final_docs if d.get("retrieval_source") == "graph")
@@ -244,17 +262,22 @@ class IntentRouter:
 
         return final_docs[:10]
 
-    async def _hybrid_retrieve(self, question: str) -> List[Dict]:
+    async def _hybrid_retrieve(self, question: str, *, tool_ctx: ToolContext) -> List[Dict]:
         """混合检索：向量+ES+重排序"""
+        uid = (tool_ctx.user_id or "").strip() or "anonymous"
+        sid = (tool_ctx.session_id or "").strip() or "default"
+        rid = (tool_ctx.run_id or "").strip()
         if self.tools is not None:
             docs = await self.tools.run(
                 "hybrid_retrieve",
                 args={"query": question},
-                ctx=ToolContext(mode="rag"),
+                ctx=tool_ctx,
                 trace_inputs={"query": question},
+                idempotency_key=f"rag:{uid}:{sid}:{rid}:hybrid_retrieve:{question}",
+                idempotency_ttl_s=float(getattr(settings, "RAG_RERANK_CACHE_TTL_S", 120.0)),
             )
         else:
             docs = await self.retriever.retrieve(question)
         if len(docs) > 3:
-            docs = await self._maybe_rerank(query=question, docs=docs, top_k=10)
+            docs = await self._maybe_rerank(query=question, docs=docs, top_k=10, tool_ctx=tool_ctx)
         return docs[:10]

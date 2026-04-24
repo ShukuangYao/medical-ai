@@ -6,8 +6,12 @@ from typing import Any, Dict, Optional
 from langsmith.run_helpers import get_current_run_tree
 from pydantic import ValidationError
 
+import os
+
+from app.config import settings
+from app.core.tools.auth import AuthPolicy
 from app.core.tools.base import BaseTool, ToolContext, ToolError
-from app.core.tools.idempotency import InMemoryIdempotencyStore
+from app.core.tools.idempotency import IdempotencyStore, create_idempotency_store, InMemoryIdempotencyStore
 from app.core.tools.registry import ToolRegistry
 from app.core.metrics import inc_tool_error
 
@@ -17,11 +21,21 @@ class ToolExecutor:
         self,
         *,
         registry: ToolRegistry,
-        idempotency: Optional[InMemoryIdempotencyStore] = None,
+        idempotency: Optional[IdempotencyStore] = None,
+        auth: Optional[AuthPolicy] = None,
         default_idempotency_ttl_s: float = 60.0,
     ) -> None:
         self.registry = registry
-        self.idempotency = idempotency or InMemoryIdempotencyStore()
+        self.idempotency: IdempotencyStore = idempotency or create_idempotency_store(
+            sqlite_path=str(
+                os.getenv(
+                    "TOOL_IDEMPOTENCY_SQLITE_PATH",
+                    str(getattr(settings, "CHAT_DB_PATH", "")),
+                )
+            ),
+            redis_url=str(getattr(settings, "REDIS_URL", "")),
+        )
+        self.auth = auth or AuthPolicy.from_env()
         self.default_idempotency_ttl_s = float(default_idempotency_ttl_s)
 
     async def run(
@@ -37,6 +51,9 @@ class ToolExecutor:
         tool = self.registry.get(name)
         if tool is None:
             raise ToolError(code="NOT_FOUND", message=f"Tool not found: {name}", retriable=False)
+
+        # Hard auth (Phase 1): best-effort guard for expensive/sensitive tools
+        self.auth.authorize(tool=tool, ctx=ctx)
 
         # Idempotency cache (best-effort)
         if idempotency_key:

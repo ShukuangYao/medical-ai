@@ -307,6 +307,16 @@ class LocalDocQA:
 
         with tracing_context(parent=run):
             try:
+                effective_user_id = (user_id or "").strip() or "anonymous"
+                effective_session_id = (session_id or "").strip() or "default"
+                effective_run_id = (cancel_run_id or "").strip()
+                rag_tool_ctx = ToolContext(
+                    user_id=effective_user_id,
+                    session_id=effective_session_id,
+                    run_id=effective_run_id,
+                    mode="rag",
+                )
+
                 if not self.initialized:
                     if emit_thinking:
                         yield _thinking("⏳ 正在初始化检索与模型组件，请稍候...")
@@ -546,14 +556,10 @@ class LocalDocQA:
                         rewritten_question = await self.tools.run(
                             "rewrite_question",
                             args={"question": question, "chat_history": chat_history},
-                            ctx=ToolContext(
-                                user_id=str(user_id or ""),
-                                session_id=str(session_id or ""),
-                                mode="rag",
-                            ),
+                            ctx=rag_tool_ctx,
                             trace_inputs={"question": question, "chat_history_len": len(chat_history or [])},
                             # Do NOT key by session_id; users can ask the same question in a new session.
-                            idempotency_key=f"rewrite:{str(user_id or '')}:{hist_sig}:{question}",
+                            idempotency_key=f"rewrite:{effective_user_id}:{hist_sig}:{question}",
                             idempotency_ttl_s=float(getattr(settings, "RAG_REWRITE_CACHE_TTL_S", 120.0)),
                         )
                     except ToolError as e:
@@ -598,6 +604,7 @@ class LocalDocQA:
                         intent_result,
                         rewritten_question,
                         graph_enabled=use_graph,
+                        tool_ctx=rag_tool_ctx,
                     )
                 except ToolError as e:
                     yield {"type": "error", "content": e.message, **e.to_event_fields()}

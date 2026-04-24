@@ -15,6 +15,7 @@ class HybridRetrieveArgs(BaseModel):
 class HybridRetrieveTool(BaseTool[HybridRetrieveArgs, List[Dict[str, Any]]]):
     name = "hybrid_retrieve"
     ArgsModel = HybridRetrieveArgs
+    auth_required = True
 
     def __init__(self, retriever: ParentRetriever):
         self._retriever = retriever

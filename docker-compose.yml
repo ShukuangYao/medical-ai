@@ -117,6 +117,8 @@ services:
   # ========== Neo4j ==========
   neo4j:
     image: neo4j:5.15
+    restart: unless-stopped
+    command: ["neo4j", "console"]
     environment:
       - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
       - NEO4J_PLUGINS=["apoc"]

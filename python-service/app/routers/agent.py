@@ -167,6 +167,14 @@ async def agent_diagnose(http_request: Request, request: ChatRequest):
             detail = stream_errors[-1] if stream_errors else "诊断失败（未收到结构化结果；请查看 Python 日志或 LangSmith trace）"
             raise HTTPException(status_code=500, detail=detail)
 
+        # Phase 5: ensure report conforms to AgentReport schema (response_model depends on it)
+        try:
+            from app.models.response import AgentReport
+
+            report = AgentReport.parse_obj(report).dict()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"结构化报告校验失败: {e}")
+
         # Prefer report trace if present
         report_trace = report.get("trace") if isinstance(report, dict) else None
         if isinstance(report_trace, list) and report_trace:

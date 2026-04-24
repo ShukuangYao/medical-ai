@@ -17,6 +17,7 @@ class RerankArgs(BaseModel):
 class RerankTool(BaseTool[RerankArgs, List[Dict[str, Any]]]):
     name = "rerank"
     ArgsModel = RerankArgs
+    auth_required = True
 
     def __init__(self, reranker: BGEReranker):
         self._reranker = reranker

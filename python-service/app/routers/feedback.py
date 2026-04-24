@@ -8,10 +8,14 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.core.eval_store import EvalSampleStore
 from app.core.feedback_store import FeedbackStore
+from app.core.session_store import SessionStore
 
 router = APIRouter()
 store = FeedbackStore(settings.CHAT_DB_PATH)
+eval_store = EvalSampleStore(settings.CHAT_DB_PATH)
+session_store = SessionStore(settings.CHAT_DB_PATH)
 logger = logging.getLogger("medical-ai.feedback")
 
 
@@ -58,6 +62,51 @@ async def submit_feedback(req: Request) -> Dict[str, Any]:
         corrected_answer=fb.corrected_answer or "",
     )
 
+    # Demo-friendly: automatically persist an evaluation sample on every feedback.
+    try:
+        mode = (fb.mode or "rag").strip() or "rag"
+        uid = (fb.user_id or "anonymous").strip() or "anonymous"
+        msgs = session_store.list_messages(session_id=sid, user_id=uid, mode=mode, limit=200)
+        # Find the assistant message by message_id, and use the previous user message as input.
+        input_text = ""
+        output_text = ""
+        report = None
+        sources = None
+        for i, m in enumerate(msgs):
+            if m.id != mid:
+                continue
+            if m.role != "assistant":
+                continue
+            output_text = m.content or ""
+            report = m.report_json if isinstance(m.report_json, dict) else None
+            sources = m.sources_json if isinstance(m.sources_json, list) else None
+            # previous user message as input (best-effort)
+            if i > 0 and msgs[i - 1].role == "user":
+                input_text = msgs[i - 1].content or ""
+            break
+        if not input_text:
+            input_text = f"(unknown_input_for_message_id:{mid})"
+        if not output_text:
+            output_text = f"(unknown_output_for_message_id:{mid})"
+
+        eval_store.add_sample(
+            sample_id=str(uuid.uuid4()),
+            run_id=rid,
+            session_id=sid,
+            message_id=mid,
+            mode=mode,
+            user_id=uid,
+            input_text=input_text,
+            output_text=output_text,
+            report=report,
+            sources=sources,
+            rating=int(fb.rating or 0),
+            comment=fb.comment or "",
+            corrected_answer=fb.corrected_answer or "",
+        )
+    except Exception as e:
+        logger.warning("eval_sample_write_failed", extra={"run_id": rid, "error": str(e)[:200]})
+
     # Best-effort: send to LangSmith feedback if configured.
     # Skip for legacy feedback without a traceable run id.
     try:
@@ -94,4 +143,31 @@ async def submit_feedback(req: Request) -> Dict[str, Any]:
             logger.warning("langsmith_feedback_failed", extra={"run_id": rid, "error": str(e)[:300]})
 
     return {"ok": True, "feedback_id": fid, "run_id": rid}
+
+
+@router.get("/eval/samples")
+async def list_eval_samples(limit: int = 50) -> Dict[str, Any]:
+    rows = eval_store.list_samples(limit=limit)
+    # Keep payload small for demo UI
+    samples = []
+    for r in rows:
+        samples.append(
+            {
+                "sample_id": r.sample_id,
+                "run_id": r.run_id,
+                "session_id": r.session_id,
+                "message_id": r.message_id,
+                "mode": r.mode,
+                "user_id": r.user_id,
+                "rating": r.rating,
+                "comment": r.comment,
+                "corrected_answer": r.corrected_answer,
+                "input_text": r.input_text,
+                "output_text": r.output_text,
+                "sources": r.sources_json,
+                "report": r.report_json,
+                "created_at": r.created_at,
+            }
+        )
+    return {"ok": True, "samples": samples}
 
